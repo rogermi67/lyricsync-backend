@@ -82,9 +82,10 @@ app.post('/recognize', upload.single('audio'), async (req, res) => {
     const cover = track.images?.coverarthq || track.images?.coverart || '';
 
     // Cerca immagine artista (sfondo)
-    const artistImage = track.images?.background ||
-                        await fetchArtistImage(track.subtitle || '', track.title || '') ||
-                        cover;
+    const shazamBg = track.images?.background || null;
+    const itunesBg = !shazamBg ? await fetchArtistImage(track.subtitle || '', track.title || '') : null;
+    const artistImage = shazamBg || itunesBg || cover;
+    console.log(`🖼️ Immagini: shazam_bg=${shazamBg ? 'SI' : 'NO'}, itunes=${itunesBg ? 'SI' : 'NO'}, cover=${cover ? 'SI' : 'NO'}, finale=${artistImage ? artistImage.substring(0, 60) + '...' : 'NESSUNA'}`);
 
     const song = {
       found: true,
