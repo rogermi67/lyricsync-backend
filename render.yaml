@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: lyricsync-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: RAPIDAPI_KEY
+        sync: false
+      - key: NODE_ENV
+        value: production
