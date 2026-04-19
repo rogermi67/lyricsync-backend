@@ -163,19 +163,34 @@ app.post('/recognize', upload.single('audio'), async (req, res) => {
         body: base64Audio
       });
 
-      // 429 = rate limit, 402 = quota esaurita → prova prossima chiave
-      if (response.status === 429 || response.status === 402) {
-        console.log(`⚠️ Chiave ${keyPrefix(activeKey.key)} ha risposto ${response.status}`);
+      // Log status HTTP
+      console.log(`📡 Shazam risposta HTTP: ${response.status}`);
+
+      // 429 = rate limit, 402 = quota esaurita, 403 = non autorizzato → prova prossima chiave
+      if (response.status === 429 || response.status === 402 || response.status === 403) {
+        const errBody = await response.text();
+        console.log(`⚠️ Chiave ${keyPrefix(activeKey.key)} ha risposto ${response.status}: ${errBody.substring(0, 200)}`);
         markKeyExhausted(activeKey.key);
         continue;
       }
 
+      if (!response.ok) {
+        const errBody = await response.text();
+        console.log(`❌ Shazam errore ${response.status}: ${errBody.substring(0, 300)}`);
+        break;
+      }
+
       data = await response.json();
       usedKey = activeKey;
+      // Log della risposta Shazam per debug
+      console.log(`🔍 Shazam response: matches=${data.matches?.length || 0}, track=${data.track ? data.track.title : 'NO'}, keys=${Object.keys(data).join(',')}`);
       break;
     }
 
-    if (!data || !data?.track) return res.json({ found: false });
+    if (!data || !data?.track) {
+      console.log(`❌ Non trovata. Risposta Shazam: ${JSON.stringify(data || {}).substring(0, 300)}`);
+      return res.json({ found: false });
+    }
 
     const track = data.track;
     const cover = track.images?.coverarthq || track.images?.coverart || '';
