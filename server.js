@@ -17,13 +17,89 @@ app.use(cors());
 app.use(express.json());
 
 const COUNTER_FILE = 'calls_counter.json';
-const TOTAL_FREE = 500;
+const TOTAL_FREE_PER_KEY = 500;
 
+// ─── Multi-key RapidAPI ─────────────────────────────────────────────────────
+// Env var: RAPIDAPI_KEYS = "key1,key2,key3" (comma-separated)
+// Fallback: RAPIDAPI_KEY (singola chiave, retrocompatibile)
+const API_KEYS = (process.env.RAPIDAPI_KEYS || process.env.RAPIDAPI_KEY || '')
+  .split(',')
+  .map(k => k.trim())
+  .filter(Boolean);
+
+// Stato chiavi: { keys: { "key_prefix": { used: N, exhausted: false, lastReset: "2026-04-17" } }, currentIndex: 0 }
 function loadCounter() {
-  try { if (fs.existsSync(COUNTER_FILE)) return JSON.parse(fs.readFileSync(COUNTER_FILE, 'utf8')); } catch {}
-  return { used: 0 };
+  try {
+    if (fs.existsSync(COUNTER_FILE)) {
+      const data = JSON.parse(fs.readFileSync(COUNTER_FILE, 'utf8'));
+      // Migrazione dal vecchio formato { used: N }
+      if (typeof data.used === 'number' && !data.keys) {
+        return { keys: {}, currentIndex: 0 };
+      }
+      return data;
+    }
+  } catch {}
+  return { keys: {}, currentIndex: 0 };
 }
-function saveCounter(data) { fs.writeFileSync(COUNTER_FILE, JSON.stringify(data)); }
+function saveCounter(data) { fs.writeFileSync(COUNTER_FILE, JSON.stringify(data, null, 2)); }
+
+function keyPrefix(key) { return key.substring(0, 8) + '...'; }
+
+function getKeyState(counter, key) {
+  const prefix = keyPrefix(key);
+  if (!counter.keys[prefix]) {
+    counter.keys[prefix] = { used: 0, exhausted: false, lastReset: new Date().toISOString().split('T')[0] };
+  }
+  // Reset giornaliero automatico (il ciclo RapidAPI è mensile, ma resettiamo il flag exhausted ogni giorno per riprovare)
+  const today = new Date().toISOString().split('T')[0];
+  if (counter.keys[prefix].lastReset !== today) {
+    counter.keys[prefix].exhausted = false;
+    counter.keys[prefix].lastReset = today;
+  }
+  return counter.keys[prefix];
+}
+
+// Trova la prossima chiave disponibile (non esaurita)
+function getActiveKey() {
+  if (API_KEYS.length === 0) return null;
+  const counter = loadCounter();
+  // Prova dalla currentIndex in avanti
+  for (let i = 0; i < API_KEYS.length; i++) {
+    const idx = (counter.currentIndex + i) % API_KEYS.length;
+    const key = API_KEYS[idx];
+    const state = getKeyState(counter, key);
+    if (!state.exhausted) {
+      if (idx !== counter.currentIndex) {
+        counter.currentIndex = idx;
+        saveCounter(counter);
+      }
+      return { key, index: idx };
+    }
+  }
+  return null; // Tutte esaurite
+}
+
+// Marca una chiave come esaurita e passa alla prossima
+function markKeyExhausted(key) {
+  const counter = loadCounter();
+  const state = getKeyState(counter, key);
+  state.exhausted = true;
+  // Avanza all'indice successivo
+  const currentIdx = API_KEYS.indexOf(key);
+  if (currentIdx >= 0) {
+    counter.currentIndex = (currentIdx + 1) % API_KEYS.length;
+  }
+  saveCounter(counter);
+  console.log(`🔑 Chiave ${keyPrefix(key)} esaurita, passo alla prossima`);
+}
+
+function recordKeyUsage(key) {
+  const counter = loadCounter();
+  const state = getKeyState(counter, key);
+  state.used += 1;
+  saveCounter(counter);
+  return state.used;
+}
 
 function convertToWav(inputPath) {
   return new Promise((resolve, reject) => {
@@ -55,28 +131,51 @@ app.post('/recognize', upload.single('audio'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Nessun file audio' });
 
-    const counter = loadCounter();
-    counter.used += 1;
-    saveCounter(counter);
-    console.log(`📊 Chiamata #${counter.used} (rimaste: ${TOTAL_FREE - counter.used})`);
+    // Trova chiave disponibile
+    let activeKey = getActiveKey();
+    if (!activeKey) {
+      console.log('❌ Tutte le chiavi API esaurite!');
+      return res.status(429).json({ error: 'Tutte le chiavi API esaurite', found: false });
+    }
 
     convertedPath = await convertToWav(req.file.path);
     const audioData = fs.readFileSync(convertedPath);
     const pcmData = audioData.slice(44);
     const base64Audio = pcmData.toString('base64');
 
-    const response = await fetch('https://shazam.p.rapidapi.com/songs/v2/detect', {
-      method: 'POST',
-      headers: {
-        'content-type': 'text/plain',
-        'X-RapidAPI-Key': process.env.RAPIDAPI_KEY,
-        'X-RapidAPI-Host': 'shazam.p.rapidapi.com'
-      },
-      body: base64Audio
-    });
+    // Prova con la chiave attiva, se fallisce prova la successiva
+    let data = null;
+    let usedKey = null;
+    for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
+      activeKey = getActiveKey();
+      if (!activeKey) break;
 
-    const data = await response.json();
-    if (!data?.track) return res.json({ found: false });
+      const callNum = recordKeyUsage(activeKey.key);
+      console.log(`📊 Chiave ${keyPrefix(activeKey.key)} [${activeKey.index + 1}/${API_KEYS.length}] — chiamata #${callNum}`);
+
+      const response = await fetch('https://shazam.p.rapidapi.com/songs/v2/detect', {
+        method: 'POST',
+        headers: {
+          'content-type': 'text/plain',
+          'X-RapidAPI-Key': activeKey.key,
+          'X-RapidAPI-Host': 'shazam.p.rapidapi.com'
+        },
+        body: base64Audio
+      });
+
+      // 429 = rate limit, 402 = quota esaurita → prova prossima chiave
+      if (response.status === 429 || response.status === 402) {
+        console.log(`⚠️ Chiave ${keyPrefix(activeKey.key)} ha risposto ${response.status}`);
+        markKeyExhausted(activeKey.key);
+        continue;
+      }
+
+      data = await response.json();
+      usedKey = activeKey;
+      break;
+    }
+
+    if (!data || !data?.track) return res.json({ found: false });
 
     const track = data.track;
     const cover = track.images?.coverarthq || track.images?.coverart || '';
@@ -174,14 +273,40 @@ app.post('/translate', async (req, res) => {
 
 app.get('/counter', (req, res) => {
   const counter = loadCounter();
-  res.json({ used: counter.used, remaining: TOTAL_FREE - counter.used, total: TOTAL_FREE });
+  // Calcola totali su tutte le chiavi
+  let totalUsed = 0;
+  const keyDetails = [];
+  for (const key of API_KEYS) {
+    const state = getKeyState(counter, key);
+    totalUsed += state.used;
+    keyDetails.push({
+      key: keyPrefix(key),
+      used: state.used,
+      exhausted: state.exhausted,
+      remaining: Math.max(0, TOTAL_FREE_PER_KEY - state.used)
+    });
+  }
+  const totalCapacity = API_KEYS.length * TOTAL_FREE_PER_KEY;
+  const totalRemaining = totalCapacity - totalUsed;
+  res.json({
+    used: totalUsed,
+    remaining: totalRemaining,
+    total: totalCapacity,
+    keysCount: API_KEYS.length,
+    activeKeyIndex: counter.currentIndex,
+    keys: keyDetails
+  });
 });
 
 app.get('/', (req, res) => res.json({ status: 'LyricSync backend attivo ✅' }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  const c = loadCounter();
   console.log(`✅ LyricSync backend attivo su http://localhost:${PORT}`);
-  console.log(`📊 Chiamate usate: ${c.used}/${TOTAL_FREE} (rimaste: ${TOTAL_FREE - c.used})`);
+  console.log(`🔑 Chiavi API configurate: ${API_KEYS.length} (capacità totale: ${API_KEYS.length * TOTAL_FREE_PER_KEY} chiamate)`);
+  API_KEYS.forEach((key, i) => {
+    const counter = loadCounter();
+    const state = getKeyState(counter, key);
+    console.log(`   [${i + 1}] ${keyPrefix(key)} — usate: ${state.used}, esaurita: ${state.exhausted}`);
+  });
 });
