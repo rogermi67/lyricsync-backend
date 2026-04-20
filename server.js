@@ -450,7 +450,7 @@ app.get('/discogs/search', async (req, res) => {
     const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
     const userAgent = 'LyricSync/1.0';
 
-    // Carica definizioni campi personalizzati della collezione (una volta)
+    // Carica definizioni campi personalizzati della collezione
     let customFields = {};
     try {
       const fieldsRes = await fetch(`https://api.discogs.com/users/${cfg.username}/collection/fields`, {
@@ -458,9 +458,12 @@ app.get('/discogs/search', async (req, res) => {
       });
       if (fieldsRes.ok) {
         const fieldsData = await fieldsRes.json();
+        console.log(`💿 Discogs fields: ${JSON.stringify(fieldsData.fields?.map(f => ({ id: f.id, name: f.name })))}`);
         for (const f of (fieldsData.fields || [])) {
           customFields[f.id] = f.name;
         }
+      } else {
+        console.log(`⚠️ Discogs fields HTTP ${fieldsRes.status}`);
       }
     } catch (e) { console.warn('⚠️ Discogs fields error:', e.message); }
 
@@ -498,14 +501,22 @@ app.get('/discogs/search', async (req, res) => {
         const instance = collData.releases[0];
         const info = instance.basic_information || {};
 
+        // Log completo per debug
+        console.log(`💿 Discogs instance keys: ${Object.keys(instance).join(', ')}`);
+        console.log(`💿 Discogs instance.notes raw: ${JSON.stringify(instance.notes)}`);
+        console.log(`💿 Discogs instance.rating: ${instance.rating}`);
+        console.log(`💿 Discogs instance.folder_id: ${instance.folder_id}`);
+
         // Mappa note con nomi dei campi personalizzati
-        const notes = (instance.notes || [])
-          .filter(n => n.value && n.value.trim())
+        const rawNotes = instance.notes || [];
+        const notes = rawNotes
+          .filter(n => n.value !== undefined && n.value !== null && String(n.value).trim() !== '')
           .map(n => ({
             fieldId: n.field_id,
             fieldName: customFields[n.field_id] || `Campo ${n.field_id}`,
-            value: n.value.trim()
+            value: String(n.value).trim()
           }));
+        console.log(`💿 Discogs notes mapped: ${JSON.stringify(notes)}`);
 
         const result = {
           found: true,
