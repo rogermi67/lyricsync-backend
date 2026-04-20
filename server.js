@@ -439,6 +439,24 @@ app.post('/discogs/config', async (req, res) => {
   res.json({ ok: true });
 });
 
+// Nomi campi personalizzati Discogs (salvati su Redis)
+app.get('/discogs/fields', async (req, res) => {
+  try {
+    const saved = await redis.get('lyricsync:discogs:fields');
+    res.json({ fields: saved || { 1: 'Media Condition', 2: 'Sleeve Condition', 3: 'Notes' } });
+  } catch { res.json({ fields: {} }); }
+});
+
+app.post('/discogs/fields', async (req, res) => {
+  try {
+    const { fields } = req.body; // { "1": "Media Condition", "2": "Sleeve Condition", "3": "Notes", "4": "Anno" }
+    if (!fields || typeof fields !== 'object') return res.status(400).json({ error: 'Dati mancanti' });
+    await redis.set('lyricsync:discogs:fields', fields);
+    console.log(`💿 Discogs fields salvati: ${JSON.stringify(fields)}`);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Cerca album nella collezione Discogs
 app.get('/discogs/search', async (req, res) => {
   try {
@@ -450,22 +468,32 @@ app.get('/discogs/search', async (req, res) => {
     const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
     const userAgent = 'LyricSync/1.0';
 
-    // Carica definizioni campi personalizzati della collezione
-    let customFields = {};
+    // Nomi campi personalizzati: prova dall'API, altrimenti usa i default Discogs
+    const DEFAULT_FIELDS = { 1: 'Media Condition', 2: 'Sleeve Condition', 3: 'Notes' };
+    let customFields = { ...DEFAULT_FIELDS };
     try {
       const fieldsRes = await fetch(`https://api.discogs.com/users/${cfg.username}/collection/fields`, {
         headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
       });
       if (fieldsRes.ok) {
         const fieldsData = await fieldsRes.json();
-        console.log(`💿 Discogs fields: ${JSON.stringify(fieldsData.fields?.map(f => ({ id: f.id, name: f.name })))}`);
         for (const f of (fieldsData.fields || [])) {
           customFields[f.id] = f.name;
         }
+        console.log(`💿 Discogs fields da API: ${JSON.stringify(customFields)}`);
       } else {
-        console.log(`⚠️ Discogs fields HTTP ${fieldsRes.status}`);
+        // Carica nomi custom da Redis (se configurati dall'utente)
+        try {
+          const savedFields = await redis.get('lyricsync:discogs:fields');
+          if (savedFields && typeof savedFields === 'object') {
+            Object.assign(customFields, savedFields);
+          }
+        } catch {}
+        console.log(`💿 Discogs fields (fallback): ${JSON.stringify(customFields)}`);
       }
-    } catch (e) { console.warn('⚠️ Discogs fields error:', e.message); }
+    } catch (e) {
+      console.warn('⚠️ Discogs fields error:', e.message);
+    }
 
     // Cerca nel database Discogs per artista + album (o titolo)
     const query = album ? `${artist} ${album}` : `${artist} ${title}`;
