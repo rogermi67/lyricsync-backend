@@ -523,21 +523,38 @@ app.get('/discogs/search', async (req, res) => {
       console.warn('⚠️ Discogs fields error:', e.message);
     }
 
-    // Cerca su Discogs per artista + titolo canzone (NON album di Shazam, che può essere una compilation)
-    const query = `${artist} ${title}`;
-    console.log(`💿 Discogs ricerca: "${query}"`);
-    const searchUrl = `https://api.discogs.com/database/search?q=${encodeURIComponent(query)}&type=release&per_page=15`;
-    const searchRes = await fetch(searchUrl, {
-      headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
-    });
-
-    if (!searchRes.ok) {
-      console.log(`❌ Discogs search error: ${searchRes.status}`);
-      return res.json({ found: false });
+    // Strategia di ricerca Discogs:
+    // 1) Cerca per artista + traccia (trova album che contengono il brano)
+    // 2) Fallback: cerca per artista + album (da Shazam)
+    const searches = [
+      { label: 'artist+track', url: `https://api.discogs.com/database/search?artist=${encodeURIComponent(artist)}&track=${encodeURIComponent(title)}&type=release&per_page=15` },
+    ];
+    if (album) {
+      searches.push({ label: 'artist+album', url: `https://api.discogs.com/database/search?artist=${encodeURIComponent(artist)}&title=${encodeURIComponent(album)}&type=release&per_page=10` });
     }
 
-    const searchData = await searchRes.json();
-    if (!searchData.results || searchData.results.length === 0) {
+    let searchData = null;
+    let searchLabel = '';
+    for (const s of searches) {
+      console.log(`💿 Discogs ricerca [${s.label}]: artist="${artist}", title/track="${title}", album="${album || ''}"`)
+      const searchRes = await fetch(s.url, {
+        headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
+      });
+      if (!searchRes.ok) {
+        console.log(`❌ Discogs search [${s.label}] error: ${searchRes.status}`);
+        continue;
+      }
+      const data = await searchRes.json();
+      if (data.results && data.results.length > 0) {
+        searchData = data;
+        searchLabel = s.label;
+        console.log(`💿 Discogs [${s.label}]: ${data.results.length} risultati`);
+        break;
+      }
+      console.log(`💿 Discogs [${s.label}]: 0 risultati, provo prossima strategia`);
+    }
+
+    if (!searchData || !searchData.results || searchData.results.length === 0) {
       return res.json({ found: false });
     }
 
@@ -600,7 +617,7 @@ app.get('/discogs/search', async (req, res) => {
 
     // Non in collezione ma trovato su Discogs
     const first = searchData.results[0];
-    console.log(`💿 Discogs: "${first.title}" trovato ma NON in collezione`);
+    console.log(`💿 Discogs [${searchLabel}]: "${first.title}" trovato ma NON in collezione`);
     res.json({
       found: true,
       inCollection: false,
