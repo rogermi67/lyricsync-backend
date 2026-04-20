@@ -17,6 +17,31 @@ const upload = multer({ dest: 'uploads/' });
 app.use(cors());
 app.use(express.json());
 
+// ─── Protezione accesso ─────────────────────────────────────────────────────
+const APP_PASSWORD = process.env.APP_PASSWORD || '';
+
+// Endpoint per verificare la password
+app.post('/auth', (req, res) => {
+  const { password } = req.body;
+  if (!APP_PASSWORD) return res.json({ ok: true }); // nessuna password configurata
+  if (password === APP_PASSWORD) return res.json({ ok: true });
+  res.status(401).json({ ok: false, error: 'Password errata' });
+});
+
+// Middleware: protegge tutte le route tranne /, /auth
+function authMiddleware(req, res, next) {
+  if (!APP_PASSWORD) return next(); // nessuna password = accesso libero
+  const token = req.headers['x-app-token'];
+  if (token === APP_PASSWORD) return next();
+  res.status(401).json({ error: 'Non autorizzato' });
+}
+
+// Applica protezione alle route API
+app.use('/recognize', authMiddleware);
+app.use('/lyrics', authMiddleware);
+app.use('/translate', authMiddleware);
+app.use('/counter', authMiddleware);
+
 const TOTAL_FREE_PER_KEY = 500;
 
 // ─── Multi-key RapidAPI ─────────────────────────────────────────────────────
