@@ -6,6 +6,7 @@ const fetch = require('node-fetch');
 const fs = require('fs');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
+const { Redis } = require('@upstash/redis');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -16,41 +17,50 @@ const upload = multer({ dest: 'uploads/' });
 app.use(cors());
 app.use(express.json());
 
-const COUNTER_FILE = 'calls_counter.json';
 const TOTAL_FREE_PER_KEY = 500;
 
 // ─── Multi-key RapidAPI ─────────────────────────────────────────────────────
-// Env var: RAPIDAPI_KEYS = "key1,key2,key3" (comma-separated)
-// Fallback: RAPIDAPI_KEY (singola chiave, retrocompatibile)
 const API_KEYS = (process.env.RAPIDAPI_KEYS || process.env.RAPIDAPI_KEY || '')
   .split(',')
   .map(k => k.trim())
   .filter(Boolean);
 
-// Stato chiavi: { keys: { "key_prefix": { used: N, exhausted: false, lastReset: "2026-04-17" } }, currentIndex: 0 }
-function loadCounter() {
-  try {
-    if (fs.existsSync(COUNTER_FILE)) {
-      const data = JSON.parse(fs.readFileSync(COUNTER_FILE, 'utf8'));
-      // Migrazione dal vecchio formato { used: N }
-      if (typeof data.used === 'number' && !data.keys) {
-        return { keys: {}, currentIndex: 0 };
-      }
-      return data;
-    }
-  } catch {}
-  return { keys: {}, currentIndex: 0 };
-}
-function saveCounter(data) { fs.writeFileSync(COUNTER_FILE, JSON.stringify(data, null, 2)); }
+// ─── Upstash Redis per contatore persistente ────────────────────────────────
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_URL,
+  token: process.env.UPSTASH_REDIS_TOKEN,
+});
+
+// Cache locale per ridurre chiamate Redis (aggiornata ad ogni write)
+let localCache = { keys: {}, currentIndex: 0 };
 
 function keyPrefix(key) { return key.substring(0, 8) + '...'; }
 
+async function loadCounter() {
+  try {
+    const data = await redis.get('lyricsync:counter');
+    if (data && typeof data === 'object') {
+      localCache = data;
+      return data;
+    }
+  } catch (err) { console.warn('⚠️ Redis read error:', err.message); }
+  return localCache; // fallback alla cache locale
+}
+
+async function saveCounter(data) {
+  localCache = data;
+  try {
+    await redis.set('lyricsync:counter', data);
+  } catch (err) { console.warn('⚠️ Redis write error:', err.message); }
+}
+
 function getKeyState(counter, key) {
   const prefix = keyPrefix(key);
+  if (!counter.keys) counter.keys = {};
   if (!counter.keys[prefix]) {
     counter.keys[prefix] = { used: 0, exhausted: false, lastReset: new Date().toISOString().split('T')[0] };
   }
-  // Reset giornaliero automatico (il ciclo RapidAPI è mensile, ma resettiamo il flag exhausted ogni giorno per riprovare)
+  // Reset giornaliero del flag exhausted (per riprovare chiavi che erano rate-limited)
   const today = new Date().toISOString().split('T')[0];
   if (counter.keys[prefix].lastReset !== today) {
     counter.keys[prefix].exhausted = false;
@@ -60,44 +70,42 @@ function getKeyState(counter, key) {
 }
 
 // Trova la prossima chiave disponibile (non esaurita)
-function getActiveKey() {
+async function getActiveKey() {
   if (API_KEYS.length === 0) return null;
-  const counter = loadCounter();
-  // Prova dalla currentIndex in avanti
+  const counter = await loadCounter();
   for (let i = 0; i < API_KEYS.length; i++) {
-    const idx = (counter.currentIndex + i) % API_KEYS.length;
+    const idx = ((counter.currentIndex || 0) + i) % API_KEYS.length;
     const key = API_KEYS[idx];
     const state = getKeyState(counter, key);
     if (!state.exhausted) {
       if (idx !== counter.currentIndex) {
         counter.currentIndex = idx;
-        saveCounter(counter);
+        await saveCounter(counter);
       }
       return { key, index: idx };
     }
   }
-  return null; // Tutte esaurite
+  return null;
 }
 
 // Marca una chiave come esaurita e passa alla prossima
-function markKeyExhausted(key) {
-  const counter = loadCounter();
+async function markKeyExhausted(key) {
+  const counter = await loadCounter();
   const state = getKeyState(counter, key);
   state.exhausted = true;
-  // Avanza all'indice successivo
   const currentIdx = API_KEYS.indexOf(key);
   if (currentIdx >= 0) {
     counter.currentIndex = (currentIdx + 1) % API_KEYS.length;
   }
-  saveCounter(counter);
+  await saveCounter(counter);
   console.log(`🔑 Chiave ${keyPrefix(key)} esaurita, passo alla prossima`);
 }
 
-function recordKeyUsage(key) {
-  const counter = loadCounter();
+async function recordKeyUsage(key) {
+  const counter = await loadCounter();
   const state = getKeyState(counter, key);
   state.used += 1;
-  saveCounter(counter);
+  await saveCounter(counter);
   return state.used;
 }
 
@@ -132,7 +140,7 @@ app.post('/recognize', upload.single('audio'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'Nessun file audio' });
 
     // Trova chiave disponibile
-    let activeKey = getActiveKey();
+    let activeKey = await getActiveKey();
     if (!activeKey) {
       console.log('❌ Tutte le chiavi API esaurite!');
       return res.status(429).json({ error: 'Tutte le chiavi API esaurite', found: false });
@@ -147,10 +155,10 @@ app.post('/recognize', upload.single('audio'), async (req, res) => {
     let data = null;
     let usedKey = null;
     for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
-      activeKey = getActiveKey();
+      activeKey = await getActiveKey();
       if (!activeKey) break;
 
-      const callNum = recordKeyUsage(activeKey.key);
+      const callNum = await recordKeyUsage(activeKey.key);
       console.log(`📊 Chiave ${keyPrefix(activeKey.key)} [${activeKey.index + 1}/${API_KEYS.length}] — chiamata #${callNum}`);
 
       const response = await fetch('https://shazam.p.rapidapi.com/songs/v2/detect', {
@@ -170,7 +178,7 @@ app.post('/recognize', upload.single('audio'), async (req, res) => {
       if (response.status === 429 || response.status === 402 || response.status === 403) {
         const errBody = await response.text();
         console.log(`⚠️ Chiave ${keyPrefix(activeKey.key)} ha risposto ${response.status}: ${errBody.substring(0, 200)}`);
-        markKeyExhausted(activeKey.key);
+        await markKeyExhausted(activeKey.key);
         continue;
       }
 
@@ -286,41 +294,64 @@ app.post('/translate', async (req, res) => {
   }
 });
 
-app.get('/counter', (req, res) => {
-  const counter = loadCounter();
-  // Calcola totali su tutte le chiavi
+app.get('/counter', async (req, res) => {
+  const counter = await loadCounter();
   let totalUsed = 0;
+  let totalRemaining = 0;
   const keyDetails = [];
   for (const key of API_KEYS) {
     const state = getKeyState(counter, key);
     totalUsed += state.used;
+    const keyRemaining = state.exhausted ? 0 : Math.max(0, TOTAL_FREE_PER_KEY - state.used);
+    totalRemaining += keyRemaining;
     keyDetails.push({
       key: keyPrefix(key),
       used: state.used,
       exhausted: state.exhausted,
-      remaining: Math.max(0, TOTAL_FREE_PER_KEY - state.used)
+      remaining: keyRemaining
     });
   }
   const totalCapacity = API_KEYS.length * TOTAL_FREE_PER_KEY;
-  const totalRemaining = totalCapacity - totalUsed;
   res.json({
     used: totalUsed,
     remaining: totalRemaining,
     total: totalCapacity,
     keysCount: API_KEYS.length,
-    activeKeyIndex: counter.currentIndex,
+    activeKeyIndex: counter.currentIndex || 0,
     keys: keyDetails
   });
+});
+
+// Reset contatore (utile a inizio mese quando RapidAPI resetta la quota)
+app.post('/counter/reset', async (req, res) => {
+  try {
+    const counter = await loadCounter();
+    for (const key of API_KEYS) {
+      const prefix = keyPrefix(key);
+      if (counter.keys && counter.keys[prefix]) {
+        counter.keys[prefix].used = 0;
+        counter.keys[prefix].exhausted = false;
+        counter.keys[prefix].lastReset = new Date().toISOString().split('T')[0];
+      }
+    }
+    counter.currentIndex = 0;
+    await saveCounter(counter);
+    console.log('🔄 Contatori resettati manualmente');
+    res.json({ success: true, message: 'Tutti i contatori resettati' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/', (req, res) => res.json({ status: 'LyricSync backend attivo ✅' }));
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`✅ LyricSync backend attivo su http://localhost:${PORT}`);
   console.log(`🔑 Chiavi API configurate: ${API_KEYS.length} (capacità totale: ${API_KEYS.length * TOTAL_FREE_PER_KEY} chiamate)`);
+  console.log(`💾 Redis: ${process.env.UPSTASH_REDIS_URL ? 'configurato' : '⚠️ NON configurato — i contatori non persistono!'}`);
+  const counter = await loadCounter();
   API_KEYS.forEach((key, i) => {
-    const counter = loadCounter();
     const state = getKeyState(counter, key);
     console.log(`   [${i + 1}] ${keyPrefix(key)} — usate: ${state.used}, esaurita: ${state.exhausted}`);
   });
