@@ -45,21 +45,46 @@ app.use('/counter', authMiddleware);
 const TOTAL_FREE_PER_KEY = 500;
 
 // ─── Multi-key RapidAPI ─────────────────────────────────────────────────────
-const API_KEYS = (process.env.RAPIDAPI_KEYS || process.env.RAPIDAPI_KEY || '')
+// Chiavi da env (fallback)
+const ENV_KEYS = (process.env.RAPIDcachedApiKeys || process.env.RAPIDAPI_KEY || '')
   .split(',')
   .map(k => k.trim())
   .filter(Boolean);
 
-// ─── Upstash Redis per contatore persistente ────────────────────────────────
+// ─── Upstash Redis per contatore + chiavi persistenti ───────────────────────
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_URL,
   token: process.env.UPSTASH_REDIS_TOKEN,
 });
 
-// Cache locale per ridurre chiamate Redis (aggiornata ad ogni write)
+// Cache locale
 let localCache = { keys: {}, currentIndex: 0 };
+let cachedApiKeys = [...ENV_KEYS]; // cache delle chiavi API attive
 
 function keyPrefix(key) { return key.substring(0, 8) + '...'; }
+
+// Carica chiavi da Redis + env (dedup per valore completo)
+async function loadApiKeys() {
+  let redisKeys = [];
+  try {
+    const stored = await redis.get('lyricsync:apikeys');
+    if (Array.isArray(stored)) redisKeys = stored;
+  } catch (err) { console.warn('⚠️ Redis keys read error:', err.message); }
+  // Unisci env + redis, dedup
+  const all = [...ENV_KEYS, ...redisKeys];
+  const unique = [...new Set(all)].filter(Boolean);
+  cachedApiKeys = unique;
+  return unique;
+}
+
+async function saveApiKeys(keys) {
+  // Salva su Redis solo le chiavi NON presenti nelle env (per non duplicare)
+  const redisOnly = keys.filter(k => !ENV_KEYS.includes(k));
+  try {
+    await redis.set('lyricsync:apikeys', redisOnly);
+  } catch (err) { console.warn('⚠️ Redis keys write error:', err.message); }
+  cachedApiKeys = keys;
+}
 
 async function loadCounter() {
   try {
@@ -69,7 +94,7 @@ async function loadCounter() {
       return data;
     }
   } catch (err) { console.warn('⚠️ Redis read error:', err.message); }
-  return localCache; // fallback alla cache locale
+  return localCache;
 }
 
 async function saveCounter(data) {
@@ -85,7 +110,6 @@ function getKeyState(counter, key) {
   if (!counter.keys[prefix]) {
     counter.keys[prefix] = { used: 0, exhausted: false, lastReset: new Date().toISOString().split('T')[0] };
   }
-  // Reset giornaliero del flag exhausted (per riprovare chiavi che erano rate-limited)
   const today = new Date().toISOString().split('T')[0];
   if (counter.keys[prefix].lastReset !== today) {
     counter.keys[prefix].exhausted = false;
@@ -94,33 +118,33 @@ function getKeyState(counter, key) {
   return counter.keys[prefix];
 }
 
-// Trova la prossima chiave disponibile (non esaurita)
 async function getActiveKey() {
-  if (API_KEYS.length === 0) return null;
+  const apiKeys = await loadApiKeys();
+  if (apiKeys.length === 0) return null;
   const counter = await loadCounter();
-  for (let i = 0; i < API_KEYS.length; i++) {
-    const idx = ((counter.currentIndex || 0) + i) % API_KEYS.length;
-    const key = API_KEYS[idx];
+  for (let i = 0; i < apiKeys.length; i++) {
+    const idx = ((counter.currentIndex || 0) + i) % apiKeys.length;
+    const key = apiKeys[idx];
     const state = getKeyState(counter, key);
     if (!state.exhausted) {
       if (idx !== counter.currentIndex) {
         counter.currentIndex = idx;
         await saveCounter(counter);
       }
-      return { key, index: idx };
+      return { key, index: idx, total: apiKeys.length };
     }
   }
   return null;
 }
 
-// Marca una chiave come esaurita e passa alla prossima
 async function markKeyExhausted(key) {
+  const apiKeys = cachedApiKeys;
   const counter = await loadCounter();
   const state = getKeyState(counter, key);
   state.exhausted = true;
-  const currentIdx = API_KEYS.indexOf(key);
+  const currentIdx = apiKeys.indexOf(key);
   if (currentIdx >= 0) {
-    counter.currentIndex = (currentIdx + 1) % API_KEYS.length;
+    counter.currentIndex = (currentIdx + 1) % apiKeys.length;
   }
   await saveCounter(counter);
   console.log(`🔑 Chiave ${keyPrefix(key)} esaurita, passo alla prossima`);
@@ -179,12 +203,12 @@ app.post('/recognize', upload.single('audio'), async (req, res) => {
     // Prova con la chiave attiva, se fallisce prova la successiva
     let data = null;
     let usedKey = null;
-    for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
+    for (let attempt = 0; attempt < cachedApiKeys.length; attempt++) {
       activeKey = await getActiveKey();
       if (!activeKey) break;
 
       const callNum = await recordKeyUsage(activeKey.key);
-      console.log(`📊 Chiave ${keyPrefix(activeKey.key)} [${activeKey.index + 1}/${API_KEYS.length}] — chiamata #${callNum}`);
+      console.log(`📊 Chiave ${keyPrefix(activeKey.key)} [${activeKey.index + 1}/${cachedApiKeys.length}] — chiamata #${callNum}`);
 
       const response = await fetch('https://shazam.p.rapidapi.com/songs/v2/detect', {
         method: 'POST',
@@ -324,7 +348,7 @@ app.get('/counter', async (req, res) => {
   let totalUsed = 0;
   let totalRemaining = 0;
   const keyDetails = [];
-  for (const key of API_KEYS) {
+  for (const key of cachedApiKeys) {
     const state = getKeyState(counter, key);
     totalUsed += state.used;
     const keyRemaining = state.exhausted ? 0 : Math.max(0, TOTAL_FREE_PER_KEY - state.used);
@@ -336,12 +360,12 @@ app.get('/counter', async (req, res) => {
       remaining: keyRemaining
     });
   }
-  const totalCapacity = API_KEYS.length * TOTAL_FREE_PER_KEY;
+  const totalCapacity = cachedApiKeys.length * TOTAL_FREE_PER_KEY;
   res.json({
     used: totalUsed,
     remaining: totalRemaining,
     total: totalCapacity,
-    keysCount: API_KEYS.length,
+    keysCount: cachedApiKeys.length,
     activeKeyIndex: counter.currentIndex || 0,
     keys: keyDetails
   });
@@ -351,7 +375,7 @@ app.get('/counter', async (req, res) => {
 app.post('/counter/reset', async (req, res) => {
   try {
     const counter = await loadCounter();
-    for (const key of API_KEYS) {
+    for (const key of cachedApiKeys) {
       const prefix = keyPrefix(key);
       if (counter.keys && counter.keys[prefix]) {
         counter.keys[prefix].used = 0;
@@ -368,15 +392,62 @@ app.post('/counter/reset', async (req, res) => {
   }
 });
 
+// ─── Gestione chiavi API da frontend ─────────────────────────────────────────
+app.use('/keys', authMiddleware);
+
+// Lista chiavi (mascherate)
+app.get('/keys', async (req, res) => {
+  const apiKeys = await loadApiKeys();
+  const counter = await loadCounter();
+  const keys = apiKeys.map((key, i) => {
+    const state = getKeyState(counter, key);
+    return {
+      index: i,
+      prefix: keyPrefix(key),
+      source: ENV_KEYS.includes(key) ? 'env' : 'redis',
+      used: state.used,
+      exhausted: state.exhausted,
+      remaining: state.exhausted ? 0 : Math.max(0, TOTAL_FREE_PER_KEY - state.used)
+    };
+  });
+  res.json({ keys, total: apiKeys.length });
+});
+
+// Aggiungi chiave
+app.post('/keys', async (req, res) => {
+  const { key } = req.body;
+  if (!key || key.trim().length < 10) return res.status(400).json({ error: 'Chiave non valida' });
+  const apiKeys = await loadApiKeys();
+  if (apiKeys.includes(key.trim())) return res.status(400).json({ error: 'Chiave già presente' });
+  apiKeys.push(key.trim());
+  await saveApiKeys(apiKeys);
+  console.log(`🔑 Nuova chiave aggiunta: ${keyPrefix(key.trim())} (totale: ${apiKeys.length})`);
+  res.json({ ok: true, total: apiKeys.length });
+});
+
+// Rimuovi chiave (solo quelle da Redis, non da env)
+app.delete('/keys/:index', async (req, res) => {
+  const idx = parseInt(req.params.index);
+  const apiKeys = await loadApiKeys();
+  if (idx < 0 || idx >= apiKeys.length) return res.status(400).json({ error: 'Indice non valido' });
+  const key = apiKeys[idx];
+  if (ENV_KEYS.includes(key)) return res.status(400).json({ error: 'Non puoi rimuovere chiavi da variabili d\'ambiente' });
+  apiKeys.splice(idx, 1);
+  await saveApiKeys(apiKeys);
+  console.log(`🔑 Chiave rimossa: ${keyPrefix(key)} (totale: ${apiKeys.length})`);
+  res.json({ ok: true, total: apiKeys.length });
+});
+
 app.get('/', (req, res) => res.json({ status: 'LyricSync backend attivo ✅' }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, async () => {
   console.log(`✅ LyricSync backend attivo su http://localhost:${PORT}`);
-  console.log(`🔑 Chiavi API configurate: ${API_KEYS.length} (capacità totale: ${API_KEYS.length * TOTAL_FREE_PER_KEY} chiamate)`);
-  console.log(`💾 Redis: ${process.env.UPSTASH_REDIS_URL ? 'configurato' : '⚠️ NON configurato — i contatori non persistono!'}`);
+  const apiKeys = await loadApiKeys();
+  console.log(`🔑 Chiavi API: ${apiKeys.length} (${ENV_KEYS.length} da env + ${apiKeys.length - ENV_KEYS.length} da Redis) — capacità: ${apiKeys.length * TOTAL_FREE_PER_KEY} chiamate`);
+  console.log(`💾 Redis: ${process.env.UPSTASH_REDIS_URL ? 'configurato' : '⚠️ NON configurato!'}`);
   const counter = await loadCounter();
-  API_KEYS.forEach((key, i) => {
+  apiKeys.forEach((key, i) => {
     const state = getKeyState(counter, key);
     console.log(`   [${i + 1}] ${keyPrefix(key)} — usate: ${state.used}, esaurita: ${state.exhausted}`);
   });
