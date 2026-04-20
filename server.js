@@ -523,20 +523,70 @@ app.get('/discogs/search', async (req, res) => {
       console.warn('⚠️ Discogs fields error:', e.message);
     }
 
-    // Strategia di ricerca Discogs:
-    // 1) Cerca per artista + traccia (trova album che contengono il brano)
-    // 2) Fallback: cerca per artista + album (da Shazam)
-    const searches = [
-      { label: 'artist+track', url: `https://api.discogs.com/database/search?artist=${encodeURIComponent(artist)}&track=${encodeURIComponent(title)}&type=release&per_page=15` },
-    ];
+    // Strategie di ricerca Discogs (provate TUTTE per trovare match in collezione):
+    // 1) artista + album (da Shazam) — match diretto più probabile
+    // 2) artista + traccia — trova release che contengono il brano
+    // 3) query generica artista + titolo
+    const searches = [];
     if (album) {
       searches.push({ label: 'artist+album', url: `https://api.discogs.com/database/search?artist=${encodeURIComponent(artist)}&title=${encodeURIComponent(album)}&type=release&per_page=10` });
     }
+    searches.push({ label: 'artist+track', url: `https://api.discogs.com/database/search?artist=${encodeURIComponent(artist)}&track=${encodeURIComponent(title)}&type=release&per_page=15` });
+    searches.push({ label: 'query', url: `https://api.discogs.com/database/search?q=${encodeURIComponent(artist + ' ' + title)}&type=release&per_page=10` });
 
-    let searchData = null;
-    let searchLabel = '';
+    // Helper: controlla collezione per una lista di release
+    async function checkCollection(releases, label) {
+      for (const release of releases) {
+        const collUrl = `https://api.discogs.com/users/${cfg.username}/collection/releases/${release.id}`;
+        try {
+          const collRes = await fetch(collUrl, {
+            headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
+          });
+          if (!collRes.ok) continue;
+          const collData = await collRes.json();
+          if (!collData.releases || collData.releases.length === 0) continue;
+
+          const instance = collData.releases[0];
+          const info = instance.basic_information || {};
+
+          const rawNotes = instance.notes || [];
+          const notes = rawNotes
+            .filter(n => n.value !== undefined && n.value !== null && String(n.value).trim() !== '')
+            .map(n => ({
+              fieldId: n.field_id,
+              fieldName: customFields[n.field_id] || `Campo ${n.field_id}`,
+              value: String(n.value).trim()
+            }));
+
+          const result = {
+            found: true,
+            inCollection: true,
+            releaseId: release.id,
+            title: info.title || release.title || '',
+            artist: info.artists?.map(a => a.name).join(', ') || '',
+            year: info.year || release.year || '',
+            label: info.labels?.map(l => l.name).join(', ') || '',
+            catno: info.labels?.[0]?.catno || '',
+            format: info.formats?.map(f => `${f.name} ${(f.descriptions || []).join(', ')}`).join(' / ') || '',
+            cover: release.cover_image || info.cover_image || '',
+            discogsUrl: `https://www.discogs.com/release/${release.id}`,
+            notes,
+            rating: instance.rating || 0
+          };
+          console.log(`💿 Discogs [${label}]: "${result.title}" IN COLLEZIONE (${result.label}, ${result.year}, rating: ${result.rating}, notes: ${notes.length})`);
+          return result;
+        } catch (e) {
+          console.warn(`⚠️ Discogs collection check error for ${release.id}:`, e.message);
+          continue;
+        }
+      }
+      return null;
+    }
+
+    // Prova TUTTE le strategie cercando match in collezione
+    let firstFound = null; // primo risultato generico (fallback se non in collezione)
     for (const s of searches) {
-      console.log(`💿 Discogs ricerca [${s.label}]: artist="${artist}", title/track="${title}", album="${album || ''}"`)
+      console.log(`💿 Discogs ricerca [${s.label}]: artist="${artist}", track="${title}", album="${album || ''}"`)
       const searchRes = await fetch(s.url, {
         headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
       });
@@ -545,90 +595,40 @@ app.get('/discogs/search', async (req, res) => {
         continue;
       }
       const data = await searchRes.json();
-      if (data.results && data.results.length > 0) {
-        searchData = data;
-        searchLabel = s.label;
-        console.log(`💿 Discogs [${s.label}]: ${data.results.length} risultati`);
-        break;
-      }
-      console.log(`💿 Discogs [${s.label}]: 0 risultati, provo prossima strategia`);
-    }
-
-    if (!searchData || !searchData.results || searchData.results.length === 0) {
-      return res.json({ found: false });
-    }
-
-    // Per ogni risultato, controlla se è DAVVERO nella collezione dell'utente
-    for (const release of searchData.results) {
-      const collUrl = `https://api.discogs.com/users/${cfg.username}/collection/releases/${release.id}`;
-      try {
-        const collRes = await fetch(collUrl, {
-          headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
-        });
-
-        if (!collRes.ok) continue;
-        const collData = await collRes.json();
-
-        // FIX: l'endpoint ritorna 200 anche se NON in collezione — controllare che ci siano release
-        if (!collData.releases || collData.releases.length === 0) continue;
-
-        const instance = collData.releases[0];
-        const info = instance.basic_information || {};
-
-        // Log completo per debug
-        console.log(`💿 Discogs instance keys: ${Object.keys(instance).join(', ')}`);
-        console.log(`💿 Discogs instance.notes raw: ${JSON.stringify(instance.notes)}`);
-        console.log(`💿 Discogs instance.rating: ${instance.rating}`);
-        console.log(`💿 Discogs instance.folder_id: ${instance.folder_id}`);
-
-        // Mappa note con nomi dei campi personalizzati
-        const rawNotes = instance.notes || [];
-        const notes = rawNotes
-          .filter(n => n.value !== undefined && n.value !== null && String(n.value).trim() !== '')
-          .map(n => ({
-            fieldId: n.field_id,
-            fieldName: customFields[n.field_id] || `Campo ${n.field_id}`,
-            value: String(n.value).trim()
-          }));
-        console.log(`💿 Discogs notes mapped: ${JSON.stringify(notes)}`);
-
-        const result = {
-          found: true,
-          inCollection: true,
-          releaseId: release.id,
-          title: info.title || release.title || '',
-          artist: info.artists?.map(a => a.name).join(', ') || '',
-          year: info.year || release.year || '',
-          label: info.labels?.map(l => l.name).join(', ') || '',
-          catno: info.labels?.[0]?.catno || '',
-          format: info.formats?.map(f => `${f.name} ${(f.descriptions || []).join(', ')}`).join(' / ') || '',
-          cover: release.cover_image || info.cover_image || '',
-          discogsUrl: `https://www.discogs.com/release/${release.id}`,
-          notes,
-          rating: instance.rating || 0
-        };
-        console.log(`💿 Discogs: "${result.title}" IN COLLEZIONE (${result.label}, ${result.year}, rating: ${result.rating}, notes: ${notes.length})`);
-        return res.json(result);
-      } catch (e) {
-        console.warn(`⚠️ Discogs collection check error for ${release.id}:`, e.message);
+      if (!data.results || data.results.length === 0) {
+        console.log(`💿 Discogs [${s.label}]: 0 risultati`);
         continue;
       }
+      console.log(`💿 Discogs [${s.label}]: ${data.results.length} risultati`);
+
+      // Salva il primo risultato come fallback
+      if (!firstFound) firstFound = { release: data.results[0], label: s.label };
+
+      // Controlla collezione per questi risultati
+      const collMatch = await checkCollection(data.results, s.label);
+      if (collMatch) return res.json(collMatch);
+
+      console.log(`💿 Discogs [${s.label}]: nessun match in collezione, provo prossima strategia`);
     }
 
     // Non in collezione ma trovato su Discogs
-    const first = searchData.results[0];
-    console.log(`💿 Discogs [${searchLabel}]: "${first.title}" trovato ma NON in collezione`);
-    res.json({
-      found: true,
-      inCollection: false,
-      releaseId: first.id,
-      title: first.title || '',
-      year: first.year || '',
-      label: first.label?.[0] || '',
-      format: first.format?.join(', ') || '',
-      cover: first.cover_image || '',
-      discogsUrl: `https://www.discogs.com/release/${first.id}`
-    });
+    if (firstFound) {
+      const first = firstFound.release;
+      console.log(`💿 Discogs [${firstFound.label}]: "${first.title}" trovato ma NON in collezione`);
+      return res.json({
+        found: true,
+        inCollection: false,
+        releaseId: first.id,
+        title: first.title || '',
+        year: first.year || '',
+        label: first.label?.[0] || '',
+        format: first.format?.join(', ') || '',
+        cover: first.cover_image || '',
+        discogsUrl: `https://www.discogs.com/release/${first.id}`
+      });
+    }
+
+    res.json({ found: false });
 
   } catch (err) {
     console.error('❌ Discogs error:', err.message);
