@@ -450,9 +450,23 @@ app.get('/discogs/search', async (req, res) => {
     const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
     const userAgent = 'LyricSync/1.0';
 
+    // Carica definizioni campi personalizzati della collezione (una volta)
+    let customFields = {};
+    try {
+      const fieldsRes = await fetch(`https://api.discogs.com/users/${cfg.username}/collection/fields`, {
+        headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
+      });
+      if (fieldsRes.ok) {
+        const fieldsData = await fieldsRes.json();
+        for (const f of (fieldsData.fields || [])) {
+          customFields[f.id] = f.name;
+        }
+      }
+    } catch (e) { console.warn('⚠️ Discogs fields error:', e.message); }
+
     // Cerca nel database Discogs per artista + album (o titolo)
     const query = album ? `${artist} ${album}` : `${artist} ${title}`;
-    const searchUrl = `https://api.discogs.com/database/search?q=${encodeURIComponent(query)}&type=release&per_page=5`;
+    const searchUrl = `https://api.discogs.com/database/search?q=${encodeURIComponent(query)}&type=release&per_page=10`;
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
     });
@@ -467,26 +481,31 @@ app.get('/discogs/search', async (req, res) => {
       return res.json({ found: false });
     }
 
-    // Per ogni risultato, controlla se è nella collezione dell'utente
+    // Per ogni risultato, controlla se è DAVVERO nella collezione dell'utente
     for (const release of searchData.results) {
       const collUrl = `https://api.discogs.com/users/${cfg.username}/collection/releases/${release.id}`;
-      const collRes = await fetch(collUrl, {
-        headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
-      });
+      try {
+        const collRes = await fetch(collUrl, {
+          headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
+        });
 
-      if (collRes.ok) {
+        if (!collRes.ok) continue;
         const collData = await collRes.json();
-        const instance = collData.releases?.[0] || {};
+
+        // FIX: l'endpoint ritorna 200 anche se NON in collezione — controllare che ci siano release
+        if (!collData.releases || collData.releases.length === 0) continue;
+
+        const instance = collData.releases[0];
         const info = instance.basic_information || {};
 
-        // Prendi dettagli dalla release
-        let releaseDetails = {};
-        try {
-          const detailRes = await fetch(`https://api.discogs.com/releases/${release.id}`, {
-            headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
-          });
-          if (detailRes.ok) releaseDetails = await detailRes.json();
-        } catch {}
+        // Mappa note con nomi dei campi personalizzati
+        const notes = (instance.notes || [])
+          .filter(n => n.value && n.value.trim())
+          .map(n => ({
+            fieldId: n.field_id,
+            fieldName: customFields[n.field_id] || `Campo ${n.field_id}`,
+            value: n.value.trim()
+          }));
 
         const result = {
           found: true,
@@ -498,14 +517,16 @@ app.get('/discogs/search', async (req, res) => {
           label: info.labels?.map(l => l.name).join(', ') || '',
           catno: info.labels?.[0]?.catno || '',
           format: info.formats?.map(f => `${f.name} ${(f.descriptions || []).join(', ')}`).join(' / ') || '',
-          country: releaseDetails.country || '',
           cover: release.cover_image || info.cover_image || '',
           discogsUrl: `https://www.discogs.com/release/${release.id}`,
-          notes: instance.notes?.map(n => ({ field: n.field_id, value: n.value })) || [],
+          notes,
           rating: instance.rating || 0
         };
-        console.log(`💿 Discogs: "${result.title}" trovato in collezione (${result.label}, ${result.year})`);
+        console.log(`💿 Discogs: "${result.title}" IN COLLEZIONE (${result.label}, ${result.year}, rating: ${result.rating}, notes: ${notes.length})`);
         return res.json(result);
+      } catch (e) {
+        console.warn(`⚠️ Discogs collection check error for ${release.id}:`, e.message);
+        continue;
       }
     }
 
@@ -520,7 +541,6 @@ app.get('/discogs/search', async (req, res) => {
       year: first.year || '',
       label: first.label?.[0] || '',
       format: first.format?.join(', ') || '',
-      country: first.country || '',
       cover: first.cover_image || '',
       discogsUrl: `https://www.discogs.com/release/${first.id}`
     });
