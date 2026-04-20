@@ -523,9 +523,10 @@ app.get('/discogs/search', async (req, res) => {
       console.warn('⚠️ Discogs fields error:', e.message);
     }
 
-    // Cerca nel database Discogs per artista + album (o titolo)
-    const query = album ? `${artist} ${album}` : `${artist} ${title}`;
-    const searchUrl = `https://api.discogs.com/database/search?q=${encodeURIComponent(query)}&type=release&per_page=10`;
+    // Cerca su Discogs per artista + titolo canzone (NON album di Shazam, che può essere una compilation)
+    const query = `${artist} ${title}`;
+    console.log(`💿 Discogs ricerca: "${query}"`);
+    const searchUrl = `https://api.discogs.com/database/search?q=${encodeURIComponent(query)}&type=release&per_page=15`;
     const searchRes = await fetch(searchUrl, {
       headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
     });
