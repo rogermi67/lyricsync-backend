@@ -59,31 +59,45 @@ const redis = new Redis({
 
 // Cache locale
 let localCache = { keys: {}, currentIndex: 0 };
-let cachedApiKeys = [...ENV_KEYS]; // cache delle chiavi API attive
+let cachedApiKeys = [...ENV_KEYS]; // cache delle chiavi API (solo stringhe per uso interno)
+let cachedKeyMeta = []; // metadata delle chiavi Redis: [{ key, email, addedAt }]
 
 function keyPrefix(key) { return key.substring(0, 8) + '...'; }
 
 // Carica chiavi da Redis + env (dedup per valore completo)
 async function loadApiKeys() {
-  let redisKeys = [];
+  let redisEntries = [];
   try {
     const stored = await redis.get('lyricsync:apikeys');
-    if (Array.isArray(stored)) redisKeys = stored;
+    if (Array.isArray(stored)) {
+      // Supporta sia vecchio formato (array di stringhe) che nuovo (array di oggetti)
+      redisEntries = stored.map(entry => {
+        if (typeof entry === 'string') return { key: entry, email: '', addedAt: '' };
+        return entry;
+      });
+    }
   } catch (err) { console.warn('⚠️ Redis keys read error:', err.message); }
-  // Unisci env + redis, dedup
+  cachedKeyMeta = redisEntries;
+  const redisKeys = redisEntries.map(e => e.key);
   const all = [...ENV_KEYS, ...redisKeys];
   const unique = [...new Set(all)].filter(Boolean);
   cachedApiKeys = unique;
   return unique;
 }
 
-async function saveApiKeys(keys) {
-  // Salva su Redis solo le chiavi NON presenti nelle env (per non duplicare)
-  const redisOnly = keys.filter(k => !ENV_KEYS.includes(k));
+async function saveApiKeyEntries(entries) {
+  // Salva su Redis solo le entry NON presenti nelle env
+  const redisOnly = entries.filter(e => !ENV_KEYS.includes(e.key));
   try {
     await redis.set('lyricsync:apikeys', redisOnly);
   } catch (err) { console.warn('⚠️ Redis keys write error:', err.message); }
-  cachedApiKeys = keys;
+  cachedKeyMeta = redisOnly;
+  cachedApiKeys = [...ENV_KEYS, ...redisOnly.map(e => e.key)];
+  cachedApiKeys = [...new Set(cachedApiKeys)].filter(Boolean);
+}
+
+function getKeyMeta(key) {
+  return cachedKeyMeta.find(e => e.key === key) || null;
 }
 
 async function loadCounter() {
@@ -395,16 +409,19 @@ app.post('/counter/reset', async (req, res) => {
 // ─── Gestione chiavi API da frontend ─────────────────────────────────────────
 app.use('/keys', authMiddleware);
 
-// Lista chiavi (mascherate)
+// Lista chiavi (mascherate, con metadata)
 app.get('/keys', async (req, res) => {
   const apiKeys = await loadApiKeys();
   const counter = await loadCounter();
   const keys = apiKeys.map((key, i) => {
     const state = getKeyState(counter, key);
+    const meta = getKeyMeta(key);
     return {
       index: i,
       prefix: keyPrefix(key),
       source: ENV_KEYS.includes(key) ? 'env' : 'redis',
+      email: meta?.email || '',
+      addedAt: meta?.addedAt || '',
       used: state.used,
       exhausted: state.exhausted,
       remaining: state.exhausted ? 0 : Math.max(0, TOTAL_FREE_PER_KEY - state.used)
@@ -413,16 +430,18 @@ app.get('/keys', async (req, res) => {
   res.json({ keys, total: apiKeys.length });
 });
 
-// Aggiungi chiave
+// Aggiungi chiave con email e data
 app.post('/keys', async (req, res) => {
-  const { key } = req.body;
+  const { key, email } = req.body;
   if (!key || key.trim().length < 10) return res.status(400).json({ error: 'Chiave non valida' });
   const apiKeys = await loadApiKeys();
   if (apiKeys.includes(key.trim())) return res.status(400).json({ error: 'Chiave già presente' });
-  apiKeys.push(key.trim());
-  await saveApiKeys(apiKeys);
-  console.log(`🔑 Nuova chiave aggiunta: ${keyPrefix(key.trim())} (totale: ${apiKeys.length})`);
-  res.json({ ok: true, total: apiKeys.length });
+  // Aggiungi come entry con metadata
+  const newEntry = { key: key.trim(), email: (email || '').trim(), addedAt: new Date().toISOString().split('T')[0] };
+  const entries = [...cachedKeyMeta, newEntry];
+  await saveApiKeyEntries(entries);
+  console.log(`🔑 Nuova chiave aggiunta: ${keyPrefix(key.trim())} (${newEntry.email || 'no email'}) — totale: ${cachedApiKeys.length}`);
+  res.json({ ok: true, total: cachedApiKeys.length });
 });
 
 // Rimuovi chiave (solo quelle da Redis, non da env)
@@ -432,10 +451,10 @@ app.delete('/keys/:index', async (req, res) => {
   if (idx < 0 || idx >= apiKeys.length) return res.status(400).json({ error: 'Indice non valido' });
   const key = apiKeys[idx];
   if (ENV_KEYS.includes(key)) return res.status(400).json({ error: 'Non puoi rimuovere chiavi da variabili d\'ambiente' });
-  apiKeys.splice(idx, 1);
-  await saveApiKeys(apiKeys);
-  console.log(`🔑 Chiave rimossa: ${keyPrefix(key)} (totale: ${apiKeys.length})`);
-  res.json({ ok: true, total: apiKeys.length });
+  const entries = cachedKeyMeta.filter(e => e.key !== key);
+  await saveApiKeyEntries(entries);
+  console.log(`🔑 Chiave rimossa: ${keyPrefix(key)} (totale: ${cachedApiKeys.length})`);
+  res.json({ ok: true, total: cachedApiKeys.length });
 });
 
 app.get('/', (req, res) => res.json({ status: 'LyricSync backend attivo ✅' }));
