@@ -332,22 +332,50 @@ app.get('/lyrics', async (req, res) => {
 // Traduzione testi via MyMemory (gratuito, 5000 parole/giorno)
 app.post('/translate', async (req, res) => {
   try {
-    const { text, targetLang = 'it' } = req.body;
-    if (!text) return res.status(400).json({ error: 'Testo mancante' });
+    const { text, lines: inputLines, targetLang = 'it' } = req.body;
+    if (!text && !inputLines) return res.status(400).json({ error: 'Testo mancante' });
 
-    // Dividi il testo in righe, traduci in blocco
-    const sourceLang = 'en'; // la maggior parte dei testi è in inglese
+    const sourceLang = 'en';
+
+    // Se riceviamo un array di righe, traduci a blocchi preservando l'allineamento
+    if (inputLines && Array.isArray(inputLines)) {
+      const translated = [];
+      // Traduci in blocchi da 8 righe per evitare il limite di 5000 char
+      const CHUNK_SIZE = 8;
+      for (let i = 0; i < inputLines.length; i += CHUNK_SIZE) {
+        const chunk = inputLines.slice(i, i + CHUNK_SIZE);
+        // Numera ogni riga come ancora per riallineamento
+        const numbered = chunk.map((line, idx) => `[${i + idx}] ${line || '...'}`).join('\n');
+        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(numbered.substring(0, 5000))}&langpair=${sourceLang}|${targetLang}&de=rogermi@gmail.com`;
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (data.responseStatus === 200 && data.responseData?.translatedText) {
+          const translatedText = data.responseData.translatedText;
+          // Riestrai le righe usando i numeri come ancore
+          for (let j = 0; j < chunk.length; j++) {
+            const lineNum = i + j;
+            const nextNum = lineNum + 1;
+            // Cerca [N] ... fino a [N+1] o fine testo
+            const regex = new RegExp(`\\[${lineNum}\\]\\s*(.+?)(?=\\s*\\[${nextNum}\\]|$)`, 's');
+            const match = translatedText.match(regex);
+            translated.push(match ? match[1].trim() : chunk[j]); // fallback: originale
+          }
+        } else {
+          // Fallback: usa le righe originali
+          chunk.forEach(line => translated.push(line));
+        }
+      }
+      return res.json({ translated: translated.join('\n'), sourceLang, targetLang });
+    }
+
+    // Fallback legacy: testo unico (per plainLyrics)
     const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text.substring(0, 5000))}&langpair=${sourceLang}|${targetLang}&de=rogermi@gmail.com`;
-
     const response = await fetch(url);
     const data = await response.json();
 
     if (data.responseStatus === 200 && data.responseData?.translatedText) {
-      res.json({
-        translated: data.responseData.translatedText,
-        sourceLang,
-        targetLang
-      });
+      res.json({ translated: data.responseData.translatedText, sourceLang, targetLang });
     } else {
       res.json({ error: 'Traduzione non disponibile' });
     }
