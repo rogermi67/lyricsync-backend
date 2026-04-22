@@ -652,6 +652,8 @@ app.get('/discogs/search', async (req, res) => {
         found: true,
         inCollection: true,
         releaseId: best.id,
+        instanceId: best.instanceId,
+        folderId: best.folderId || 0,
         title: best.title || '',
         artist: best.artists.join(', ') || '',
         year: best.year || '',
@@ -703,6 +705,45 @@ app.get('/discogs/search', async (req, res) => {
   } catch (err) {
     console.error('❌ Discogs error:', err.message);
     res.json({ found: false, error: err.message });
+  }
+});
+
+// ─── Aggiorna campo personalizzato Discogs (data ascolto) ────────────────────
+app.post('/discogs/update-field', authMiddleware, async (req, res) => {
+  try {
+    const { releaseId, instanceId, folderId, fieldId, value } = req.body;
+    if (!releaseId || !instanceId || !fieldId) {
+      return res.status(400).json({ error: 'Parametri mancanti (releaseId, instanceId, fieldId)' });
+    }
+    const cfg = await loadDiscogsConfig();
+    if (!cfg) return res.status(400).json({ error: 'Discogs non configurato' });
+
+    const folder = folderId || 0;
+    const url = `https://api.discogs.com/users/${cfg.username}/collection/folders/${folder}/releases/${releaseId}/instances/${instanceId}/fields/${fieldId}`;
+    const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
+
+    const apiRes = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': authHeader,
+        'User-Agent': 'LyricSync/1.0',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ value: String(value) })
+    });
+
+    if (apiRes.status === 204 || apiRes.ok) {
+      console.log(`💿 Discogs: campo ${fieldId} aggiornato per release ${releaseId} → "${value}"`);
+      return res.json({ success: true });
+    }
+
+    const errText = await apiRes.text();
+    console.error(`❌ Discogs update field error: ${apiRes.status} ${errText}`);
+    res.status(apiRes.status).json({ error: `Discogs API error: ${apiRes.status}`, details: errText });
+
+  } catch (err) {
+    console.error('❌ Discogs update field error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
