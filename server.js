@@ -597,10 +597,17 @@ app.get('/discogs/search', async (req, res) => {
     const artistLower = artist.toLowerCase().replace(/[^a-z0-9]/g, '');
 
     // Cerca release nella collezione il cui artista corrisponde
+    // L'includes è permesso solo se la stringa più corta è almeno il 60% di quella più lunga
+    // per evitare falsi positivi tipo "Heart" dentro "Tom Petty & The Heartbreakers"
     const matches = collection.filter(r => {
       return r.artists.some(a => {
         const aLower = a.toLowerCase().replace(/[^a-z0-9]/g, '');
-        return aLower === artistLower || aLower.includes(artistLower) || artistLower.includes(aLower);
+        if (aLower === artistLower) return true;
+        const shorter = aLower.length < artistLower.length ? aLower : artistLower;
+        const longer = aLower.length < artistLower.length ? artistLower : aLower;
+        if (shorter.length < 4) return false; // nomi troppo corti: solo match esatto
+        if (shorter.length / longer.length < 0.5) return false; // troppo diversi in lunghezza
+        return longer.includes(shorter);
       });
     });
 
@@ -738,6 +745,10 @@ app.post('/discogs/update-field', authMiddleware, async (req, res) => {
     }
 
     const errText = await apiRes.text();
+    if (apiRes.status === 403) {
+      console.warn(`⚠️ Discogs update field 403: scrittura richiede OAuth 1.0a con token utente (consumer key/secret non basta)`);
+      return res.json({ success: false, reason: 'oauth_required', message: 'Discogs richiede OAuth 1.0a per la scrittura. Funzionalità non ancora disponibile.' });
+    }
     console.error(`❌ Discogs update field error: ${apiRes.status} ${errText}`);
     res.status(apiRes.status).json({ error: `Discogs API error: ${apiRes.status}`, details: errText });
 
