@@ -628,6 +628,26 @@ app.get('/discogs/search', async (req, res) => {
           value: String(n.value).trim()
         }));
 
+      // Recupera tracklist dalla release Discogs (per pre-fetch testi)
+      let tracklist = [];
+      try {
+        const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
+        const releaseRes = await fetch(`https://api.discogs.com/releases/${best.id}`, {
+          headers: { 'Authorization': authHeader, 'User-Agent': 'LyricSync/1.0' }
+        });
+        if (releaseRes.ok) {
+          const releaseData = await releaseRes.json();
+          tracklist = (releaseData.tracklist || [])
+            .filter(t => t.type_ === 'track') // escludi headings e subheadings
+            .map(t => ({
+              position: t.position || '',
+              title: t.title || '',
+              duration: t.duration || ''
+            }));
+          console.log(`💿 Discogs tracklist: ${tracklist.length} tracce`);
+        }
+      } catch (e) { console.warn('⚠️ Discogs tracklist error:', e.message); }
+
       const result = {
         found: true,
         inCollection: true,
@@ -641,9 +661,10 @@ app.get('/discogs/search', async (req, res) => {
         cover: best.cover || '',
         discogsUrl: `https://www.discogs.com/release/${best.id}`,
         notes,
-        rating: best.rating || 0
+        rating: best.rating || 0,
+        tracklist
       };
-      console.log(`💿 Discogs: "${result.title}" IN COLLEZIONE (${result.label}, ${result.year}, notes: ${notes.length})`);
+      console.log(`💿 Discogs: "${result.title}" IN COLLEZIONE (${result.label}, ${result.year}, notes: ${notes.length}, tracks: ${tracklist.length})`);
       return res.json(result);
     }
 
