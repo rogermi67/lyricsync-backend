@@ -954,14 +954,15 @@ app.post('/discogs/update-field', authMiddleware, async (req, res) => {
     const url = `https://api.discogs.com/users/${cfg.username}/collection/folders/${folder}/releases/${releaseId}/instances/${instanceId}/fields/${fieldId}`;
 
     // Firma la richiesta con OAuth 1.0a
+    // IMPORTANTE: i parametri del body form-urlencoded DEVONO essere inclusi nella firma
     const oauth = createOAuthClient(cfg);
-    const requestData = { url, method: 'POST' };
+    const bodyData = { value: String(value) };
+    const requestData = { url, method: 'POST', data: bodyData };
     const token = { key: oauthTokens.accessToken, secret: oauthTokens.accessTokenSecret };
     const oauthHeader = oauth.toHeader(oauth.authorize(requestData, token));
 
-    // Discogs vuole Content-Type application/x-www-form-urlencoded per i custom field
-    // Il body è semplicemente "value=testo"
-    const bodyStr = `value=${encodeURIComponent(String(value))}`;
+    // Body come form-urlencoded
+    const bodyStr = new URLSearchParams(bodyData).toString();
 
     console.log(`💿 Discogs update: POST ${url}`);
     console.log(`💿 Discogs update: OAuth token=${oauthTokens.accessToken.substring(0, 8)}...`);
