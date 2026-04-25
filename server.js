@@ -629,7 +629,28 @@ app.get('/discogs/oauth/callback', async (req, res) => {
 app.get('/discogs/oauth/status', authMiddleware, async (req, res) => {
   const tokens = await loadDiscogsOAuth();
   if (tokens) {
-    res.json({ authorized: true, authorizedAt: tokens.authorizedAt || '' });
+    // Verifica che i token funzionino testando l'identità
+    let identity = null;
+    try {
+      const cfg = await loadDiscogsConfig();
+      if (cfg) {
+        const oauth = createOAuthClient(cfg);
+        const idUrl = 'https://api.discogs.com/oauth/identity';
+        const idReq = { url: idUrl, method: 'GET' };
+        const token = { key: tokens.accessToken, secret: tokens.accessTokenSecret };
+        const idHeader = oauth.toHeader(oauth.authorize(idReq, token));
+        idHeader['User-Agent'] = 'LyricSync/1.0';
+        const idRes = await fetch(idUrl, { headers: idHeader });
+        if (idRes.ok) {
+          identity = await idRes.json();
+          console.log(`🔐 OAuth identity: ${identity.username} (id: ${identity.id})`);
+        } else {
+          console.warn(`⚠️ OAuth identity check failed: ${idRes.status}`);
+        }
+      }
+    } catch (e) { console.warn('⚠️ OAuth identity error:', e.message); }
+
+    res.json({ authorized: true, authorizedAt: tokens.authorizedAt || '', username: identity?.username || '' });
   } else {
     res.json({ authorized: false });
   }
@@ -938,15 +959,24 @@ app.post('/discogs/update-field', authMiddleware, async (req, res) => {
     const token = { key: oauthTokens.accessToken, secret: oauthTokens.accessTokenSecret };
     const oauthHeader = oauth.toHeader(oauth.authorize(requestData, token));
 
+    // Discogs vuole Content-Type application/x-www-form-urlencoded per i custom field
+    // Il body è semplicemente "value=testo"
+    const bodyStr = `value=${encodeURIComponent(String(value))}`;
+
+    console.log(`💿 Discogs update: POST ${url}`);
+    console.log(`💿 Discogs update: OAuth token=${oauthTokens.accessToken.substring(0, 8)}...`);
+
     const apiRes = await fetch(url, {
       method: 'POST',
       headers: {
         ...oauthHeader,
         'User-Agent': 'LyricSync/1.0',
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: JSON.stringify({ value: String(value) })
+      body: bodyStr
     });
+
+    console.log(`💿 Discogs update response: ${apiRes.status}`);
 
     if (apiRes.status === 204 || apiRes.ok) {
       console.log(`💿 Discogs: campo ${fieldId} aggiornato per release ${releaseId} → "${value}"`);
@@ -954,15 +984,15 @@ app.post('/discogs/update-field', authMiddleware, async (req, res) => {
     }
 
     const errText = await apiRes.text();
+    console.error(`❌ Discogs update field: ${apiRes.status} ${errText}`);
+
     if (apiRes.status === 401) {
       console.warn(`⚠️ Discogs update field 401: token OAuth scaduto o revocato`);
       return res.json({ success: false, reason: 'oauth_expired', message: 'Token OAuth scaduto. Riautorizza Discogs nelle impostazioni.' });
     }
     if (apiRes.status === 403) {
-      console.warn(`⚠️ Discogs update field 403: ${errText}`);
       return res.json({ success: false, reason: 'oauth_required', message: 'Errore autorizzazione Discogs. Riprova l\'autorizzazione OAuth.' });
     }
-    console.error(`❌ Discogs update field error: ${apiRes.status} ${errText}`);
     res.status(apiRes.status).json({ error: `Discogs API error: ${apiRes.status}`, details: errText });
 
   } catch (err) {
@@ -1184,23 +1214,73 @@ app.get('/discogs/discography', authMiddleware, async (req, res) => {
       }
     }
 
-    // Step 3: incrocia con la collezione Discogs
+    // Step 3: per ogni album, cerca cover su Discogs e incrocia con la collezione
     const cfg = await loadDiscogsConfig();
-    let collectionTitlesSet = new Set();
+    let collection = [];
     if (cfg) {
-      const collection = await loadFullCollection(cfg);
-      // Normalizza titoli collezione per confronto fuzzy
-      collection.forEach(r => {
-        collectionTitlesSet.add(r.title.toLowerCase().replace(/[^a-z0-9]/g, ''));
-        // Aggiungi anche varianti senza "the", articoli, etc.
-      });
+      collection = await loadFullCollection(cfg);
     }
 
-    const enriched = releases.map(r => {
+    // Normalizza titoli collezione per confronto fuzzy
+    const collectionNormalized = collection.map(r => ({
+      ...r,
+      titleNorm: r.title.toLowerCase().replace(/[^a-z0-9]/g, '')
+    }));
+
+    const authHeader = cfg ? `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}` : '';
+    const userAgent = 'LyricSync/1.0';
+
+    // Arricchisci ogni album con cover e stato collezione
+    const enriched = [];
+    for (const r of releases) {
       const titleNorm = r.title.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const inCollection = collectionTitlesSet.has(titleNorm);
-      return { ...r, inCollection };
-    });
+      let thumb = '';
+      let inCollection = false;
+
+      // Matching con la collezione — fuzzy: includes bidirezionale + ratio lunghezza
+      for (const cr of collectionNormalized) {
+        if (cr.titleNorm === titleNorm) {
+          inCollection = true;
+          thumb = cr.cover || '';
+          break;
+        }
+        // includes bidirezionale con ratio
+        const shorter = cr.titleNorm.length < titleNorm.length ? cr.titleNorm : titleNorm;
+        const longer = cr.titleNorm.length < titleNorm.length ? titleNorm : cr.titleNorm;
+        if (shorter.length >= 4 && shorter.length / longer.length >= 0.6 && longer.includes(shorter)) {
+          // Verifica che l'artista corrisponda
+          const artistNorm = (pageTitle || artist).toLowerCase().replace(/[^a-z0-9]/g, '');
+          const crArtistMatch = cr.artists.some(a => {
+            const aN = a.toLowerCase().replace(/[^a-z0-9]/g, '');
+            return aN === artistNorm || aN.includes(artistNorm) || artistNorm.includes(aN);
+          });
+          if (crArtistMatch) {
+            inCollection = true;
+            thumb = cr.cover || '';
+            break;
+          }
+        }
+      }
+
+      // Se non abbiamo la cover dalla collezione, cerca su Discogs
+      if (!thumb && cfg) {
+        try {
+          const searchQ = `${artist} ${r.title}`;
+          const searchUrl = `https://api.discogs.com/database/search?q=${encodeURIComponent(searchQ)}&type=master&per_page=1`;
+          const sRes = await fetch(searchUrl, {
+            headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
+          });
+          if (sRes.ok) {
+            const sData = await sRes.json();
+            if (sData.results?.length > 0) {
+              thumb = sData.results[0].thumb || sData.results[0].cover_image || '';
+            }
+          }
+        } catch {}
+      }
+
+      enriched.push({ ...r, thumb, inCollection });
+    }
 
     const totalInCollection = enriched.filter(r => r.inCollection).length;
     console.log(`📀 Discografia finale: ${enriched.length} album, ${totalInCollection} in collezione`);
