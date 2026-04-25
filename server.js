@@ -1006,29 +1006,67 @@ app.get('/artist/info', authMiddleware, async (req, res) => {
   try {
     const { artist } = req.query;
     if (!artist) return res.status(400).json({ error: 'Parametro artist mancante' });
+    const ua = { 'User-Agent': 'LyricSync/1.0' };
 
-    // Step 1: cerca l'artista su Wikipedia IT
-    const searchUrl = `https://it.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(artist + ' musicista OR cantante OR band OR gruppo musicale')}&format=json&srlimit=5&utf8=1`;
-    const searchRes = await fetch(searchUrl, { headers: { 'User-Agent': 'LyricSync/1.0' } });
-    const searchData = await searchRes.json();
+    // Strategia: usa Wikidata per trovare l'entità musicale giusta, poi prendi l'articolo Wikipedia IT
+    // Step 1: cerca su Wikidata per entità di tipo musicista/band
+    let pageTitle = null;
+    try {
+      const wdUrl = `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(artist)}&language=it&format=json&limit=10&type=item`;
+      const wdRes = await fetch(wdUrl, { headers: ua });
+      const wdData = await wdRes.json();
 
-    if (!searchData.query?.search?.length) {
-      // Prova senza filtro genere
-      const fallbackUrl = `https://it.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(artist)}&format=json&srlimit=3&utf8=1`;
-      const fallbackRes = await fetch(fallbackUrl, { headers: { 'User-Agent': 'LyricSync/1.0' } });
-      const fallbackData = await fallbackRes.json();
-      if (!fallbackData.query?.search?.length) {
-        return res.json({ found: false });
+      if (wdData.search?.length) {
+        // Per ogni risultato, controlla se è un musicista/band guardando le claims P31 (instance of)
+        // Cerchiamo: Q5 (human) con P106 (occupation) musicale, oppure Q215380 (band)
+        // Approccio semplificato: prendi i primi 3 candidati e verifica su Wikipedia IT
+        for (const entity of wdData.search.slice(0, 5)) {
+          // Controlla se ha un sitelink a it.wikipedia
+          const entityUrl = `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${entity.id}&props=sitelinks|claims&sitefilter=itwiki&format=json`;
+          const entityRes = await fetch(entityUrl, { headers: ua });
+          const entityData = await entityRes.json();
+          const ent = entityData.entities?.[entity.id];
+          if (!ent) continue;
+
+          // Ha un articolo su Wikipedia IT?
+          const itTitle = ent.sitelinks?.itwiki?.title;
+          if (!itTitle) continue;
+
+          // Verifica che sia legato alla musica: P31 contiene Q5/Q215380/Q2088357 o P106 contiene musicista
+          const claims = ent.claims || {};
+          const instanceOf = (claims.P31 || []).map(c => c.mainsnak?.datavalue?.value?.id);
+          const occupations = (claims.P106 || []).map(c => c.mainsnak?.datavalue?.value?.id);
+          const genres = claims.P136 || []; // ha genere musicale
+
+          const isMusical = instanceOf.some(id => ['Q215380', 'Q2088357', 'Q5741069', 'Q56816954'].includes(id)) || // band, musical group
+            occupations.some(id => ['Q177220', 'Q639669', 'Q36834', 'Q488205', 'Q753110', 'Q855091'].includes(id)) || // singer, musician, composer, singer-songwriter
+            genres.length > 0;
+
+          if (isMusical) {
+            pageTitle = itTitle;
+            console.log(`📖 Wikidata: "${artist}" → ${entity.id} → "${itTitle}" (musicale)`);
+            break;
+          }
+        }
       }
-      searchData.query.search = fallbackData.query.search;
+    } catch (e) { console.warn('⚠️ Wikidata search error:', e.message); }
+
+    // Fallback: cerca direttamente su Wikipedia IT
+    if (!pageTitle) {
+      const searchUrl = `https://it.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(artist)}&format=json&srlimit=3&utf8=1`;
+      const searchRes = await fetch(searchUrl, { headers: ua });
+      const searchData = await searchRes.json();
+      if (searchData.query?.search?.length) {
+        pageTitle = searchData.query.search[0].title;
+        console.log(`📖 Wikipedia fallback: "${artist}" → "${pageTitle}"`);
+      }
     }
 
-    // Prendi il primo risultato
-    const pageTitle = searchData.query.search[0].title;
+    if (!pageTitle) return res.json({ found: false });
 
     // Step 2: ottieni l'estratto della pagina
     const extractUrl = `https://it.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(pageTitle)}&prop=extracts|pageimages&exintro=false&explaintext=true&exsectionformat=plain&pithumbsize=400&format=json&utf8=1`;
-    const extractRes = await fetch(extractUrl, { headers: { 'User-Agent': 'LyricSync/1.0' } });
+    const extractRes = await fetch(extractUrl, { headers: ua });
     const extractData = await extractRes.json();
 
     const pages = extractData.query?.pages || {};
@@ -1063,83 +1101,200 @@ app.get('/artist/info', authMiddleware, async (req, res) => {
   }
 });
 
-// ─── Discografia artista da Discogs con evidenza collezione ─────────────────
+// ─── Discografia artista da Wikipedia + evidenza collezione Discogs ──────────
 app.get('/discogs/discography', authMiddleware, async (req, res) => {
   try {
     const { artist } = req.query;
     if (!artist) return res.status(400).json({ error: 'Parametro artist mancante' });
+    const ua = { 'User-Agent': 'LyricSync/1.0' };
 
+    // Step 1: trova la pagina Wikipedia IT dell'artista (riusa logica Wikidata)
+    let pageTitle = null;
+    try {
+      const wdUrl = `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(artist)}&language=it&format=json&limit=10&type=item`;
+      const wdRes = await fetch(wdUrl, { headers: ua });
+      const wdData = await wdRes.json();
+      if (wdData.search?.length) {
+        for (const entity of wdData.search.slice(0, 5)) {
+          const entityUrl = `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${entity.id}&props=sitelinks|claims&sitefilter=itwiki&format=json`;
+          const entityRes = await fetch(entityUrl, { headers: ua });
+          const entityData = await entityRes.json();
+          const ent = entityData.entities?.[entity.id];
+          if (!ent) continue;
+          const itTitle = ent.sitelinks?.itwiki?.title;
+          if (!itTitle) continue;
+          const claims = ent.claims || {};
+          const instanceOf = (claims.P31 || []).map(c => c.mainsnak?.datavalue?.value?.id);
+          const occupations = (claims.P106 || []).map(c => c.mainsnak?.datavalue?.value?.id);
+          const genres = claims.P136 || [];
+          const isMusical = instanceOf.some(id => ['Q215380', 'Q2088357', 'Q5741069', 'Q56816954'].includes(id)) ||
+            occupations.some(id => ['Q177220', 'Q639669', 'Q36834', 'Q488205', 'Q753110', 'Q855091'].includes(id)) ||
+            genres.length > 0;
+          if (isMusical) { pageTitle = itTitle; break; }
+        }
+      }
+    } catch {}
+
+    if (!pageTitle) {
+      // Fallback: cerca direttamente
+      const searchUrl = `https://it.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(artist)}&format=json&srlimit=3&utf8=1`;
+      const searchRes = await fetch(searchUrl, { headers: ua });
+      const searchData = await searchRes.json();
+      if (searchData.query?.search?.length) pageTitle = searchData.query.search[0].title;
+    }
+
+    // Step 2: cerca la pagina "Discografia di <artista>" su Wikipedia IT
+    let discographyTitle = null;
+    const discTitles = [`Discografia di ${pageTitle || artist}`, `Discografia dei ${pageTitle || artist}`, `Discografia delle ${pageTitle || artist}`];
+    for (const dt of discTitles) {
+      const checkUrl = `https://it.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(dt)}&format=json&utf8=1`;
+      const checkRes = await fetch(checkUrl, { headers: ua });
+      const checkData = await checkRes.json();
+      const p = Object.values(checkData.query?.pages || {})[0];
+      if (p && p.missing === undefined) { discographyTitle = dt; break; }
+    }
+
+    // Fallback: cerca "discografia" nell'articolo dell'artista (sezione)
+    let releases = [];
+
+    if (discographyTitle) {
+      // Pagina dedicata alla discografia: estrai la sezione "Album in studio"
+      const wikiUrl = `https://it.wikipedia.org/w/api.php?action=parse&page=${encodeURIComponent(discographyTitle)}&prop=wikitext&format=json&utf8=1`;
+      const wikiRes = await fetch(wikiUrl, { headers: ua });
+      const wikiData = await wikiRes.json();
+      const wikitext = wikiData.parse?.wikitext?.['*'] || '';
+
+      // Estrai album dalla sezione "Album in studio" o "Album" del wikitext
+      releases = parseDiscographyWikitext(wikitext);
+      console.log(`📀 Discografia Wikipedia: "${discographyTitle}" → ${releases.length} album`);
+    } else if (pageTitle) {
+      // Prova a estrarre la sezione discografia dall'articolo principale
+      const secUrl = `https://it.wikipedia.org/w/api.php?action=parse&page=${encodeURIComponent(pageTitle)}&prop=sections&format=json&utf8=1`;
+      const secRes = await fetch(secUrl, { headers: ua });
+      const secData = await secRes.json();
+      const sections = secData.parse?.sections || [];
+      const discoSec = sections.find(s => s.line.toLowerCase().includes('discografia'));
+      if (discoSec) {
+        const secTextUrl = `https://it.wikipedia.org/w/api.php?action=parse&page=${encodeURIComponent(pageTitle)}&prop=wikitext&section=${discoSec.index}&format=json&utf8=1`;
+        const secTextRes = await fetch(secTextUrl, { headers: ua });
+        const secTextData = await secTextRes.json();
+        const wikitext = secTextData.parse?.wikitext?.['*'] || '';
+        releases = parseDiscographyWikitext(wikitext);
+        console.log(`📀 Discografia da sezione articolo: "${pageTitle}" → ${releases.length} album`);
+      }
+    }
+
+    // Step 3: incrocia con la collezione Discogs
     const cfg = await loadDiscogsConfig();
-    if (!cfg) return res.json({ releases: [], collection: [] });
+    let collectionTitlesSet = new Set();
+    if (cfg) {
+      const collection = await loadFullCollection(cfg);
+      // Normalizza titoli collezione per confronto fuzzy
+      collection.forEach(r => {
+        collectionTitlesSet.add(r.title.toLowerCase().replace(/[^a-z0-9]/g, ''));
+        // Aggiungi anche varianti senza "the", articoli, etc.
+      });
+    }
 
-    const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
-    const userAgent = 'LyricSync/1.0';
-
-    // Step 1: cerca l'artista su Discogs per ottenere l'ID
-    const searchUrl = `https://api.discogs.com/database/search?q=${encodeURIComponent(artist)}&type=artist&per_page=5`;
-    const searchRes = await fetch(searchUrl, {
-      headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
-    });
-    if (!searchRes.ok) return res.json({ releases: [], collection: [] });
-
-    const searchData = await searchRes.json();
-    if (!searchData.results?.length) return res.json({ releases: [], collection: [] });
-
-    const artistId = searchData.results[0].id;
-    const artistName = searchData.results[0].title;
-
-    // Step 2: ottieni le release dell'artista (solo album principali)
-    const releasesUrl = `https://api.discogs.com/artists/${artistId}/releases?sort=year&sort_order=asc&per_page=100&page=1`;
-    const releasesRes = await fetch(releasesUrl, {
-      headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
-    });
-    if (!releasesRes.ok) return res.json({ releases: [], collection: [] });
-
-    const releasesData = await releasesRes.json();
-
-    // Filtra per album principali (tipo "master" o releases con ruolo "Main")
-    const releases = (releasesData.releases || [])
-      .filter(r => r.role === 'Main' && r.type === 'master')
-      .map(r => ({
-        id: r.id,
-        title: r.title || '',
-        year: r.year || 0,
-        thumb: r.thumb || '',
-        format: r.format || '',
-        type: r.type || '',
-        resourceUrl: r.resource_url || ''
-      }));
-
-    // Step 3: carica la collezione e trova quali album sono presenti
-    const collection = await loadFullCollection(cfg);
-    const collectionTitles = new Set();
-    const collectionIds = new Set();
-    collection.forEach(r => {
-      collectionTitles.add(r.title.toLowerCase().replace(/[^a-z0-9]/g, ''));
-      collectionIds.add(r.id);
-    });
-
-    // Evidenzia quali release sono nella collezione
     const enriched = releases.map(r => {
       const titleNorm = r.title.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const inCollection = collectionIds.has(r.id) || collectionTitles.has(titleNorm);
+      const inCollection = collectionTitlesSet.has(titleNorm);
       return { ...r, inCollection };
     });
 
-    console.log(`📀 Discografia: ${artistName} — ${enriched.length} album, ${enriched.filter(r => r.inCollection).length} in collezione`);
+    const totalInCollection = enriched.filter(r => r.inCollection).length;
+    console.log(`📀 Discografia finale: ${enriched.length} album, ${totalInCollection} in collezione`);
 
     res.json({
-      artist: artistName,
-      artistId,
+      artist: pageTitle || artist,
       releases: enriched,
-      totalInCollection: enriched.filter(r => r.inCollection).length
+      totalInCollection
     });
 
   } catch (err) {
     console.error('❌ Discography error:', err.message);
-    res.json({ releases: [], collection: [], error: err.message });
+    res.json({ releases: [], error: err.message });
   }
 });
+
+// Parser wikitext discografia — estrae titoli e anni
+function parseDiscographyWikitext(wikitext) {
+  const releases = [];
+  const lines = wikitext.split('\n');
+  let inStudioSection = false;
+  let sectionDepth = 0;
+
+  for (const line of lines) {
+    // Rileva sezioni: === Album in studio === o == Album ==
+    const sectionMatch = line.match(/^(={2,})\s*(.+?)\s*={2,}/);
+    if (sectionMatch) {
+      const depth = sectionMatch[1].length;
+      const name = sectionMatch[2].toLowerCase();
+      if (name.includes('album in studio') || name.includes('album studio') ||
+          (name === 'album' && !name.includes('live') && !name.includes('raccolt'))) {
+        inStudioSection = true;
+        sectionDepth = depth;
+      } else if (inStudioSection && depth <= sectionDepth) {
+        inStudioSection = false; // fine sezione album in studio
+      }
+      continue;
+    }
+
+    // Se siamo nella sezione giusta o non abbiamo trovato una sezione specifica
+    // Cerca pattern: * [[anno]] - ''[[titolo]]'' oppure * anno – titolo
+    if (line.startsWith('*')) {
+      // Pattern: * [[1969]] - ''[[Let It Bleed]]''
+      // Pattern: * ''[[Sticky Fingers]]'' ([[1971]])
+      // Pattern: * 1969 – Let It Bleed
+      let title = null;
+      let year = null;
+
+      // Estrai anno
+      const yearMatch = line.match(/\b(19[5-9]\d|20[0-2]\d)\b/);
+      if (yearMatch) year = parseInt(yearMatch[1]);
+
+      // Estrai titolo: prova ''[[titolo]]'' o ''titolo''
+      const titleMatch = line.match(/''(?:\[\[)?([^'\]\|]+)/);
+      if (titleMatch) {
+        title = titleMatch[1].trim();
+      } else {
+        // Prova [[titolo]]
+        const linkMatch = line.match(/\[\[([^\]\|]+)/);
+        if (linkMatch && !linkMatch[1].match(/^\d{4}$/)) {
+          title = linkMatch[1].trim();
+        }
+      }
+
+      // Fallback: prova pattern "anno – titolo" o "anno - titolo"
+      if (!title) {
+        const dashMatch = line.match(/\d{4}\s*[–\-]\s*(.+)/);
+        if (dashMatch) {
+          title = dashMatch[1].replace(/[\[\]'{}]/g, '').trim();
+        }
+      }
+
+      if (title && title.length > 1) {
+        // Pulisci il titolo da markup wiki residuo
+        title = title.replace(/\[\[|\]\]/g, '').replace(/''/g, '').replace(/\{\{.*?\}\}/g, '').trim();
+        if (title && !releases.find(r => r.title === title)) {
+          releases.push({
+            title,
+            year: year || 0,
+            thumb: '',
+            type: inStudioSection ? 'studio' : 'album'
+          });
+        }
+      }
+    }
+  }
+
+  // Se non abbiamo trovato una sezione "album in studio", restituisci tutto
+  // Se l'abbiamo trovata, filtra solo quelli marcati come studio
+  if (releases.some(r => r.type === 'studio')) {
+    return releases.filter(r => r.type === 'studio');
+  }
+  return releases;
+}
 
 // ─── Gestione chiavi API da frontend ─────────────────────────────────────────
 app.use('/keys', authMiddleware);
