@@ -7,6 +7,8 @@ const fs = require('fs');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const { Redis } = require('@upstash/redis');
+const OAuth = require('oauth-1.0a');
+const crypto = require('crypto');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -449,6 +451,183 @@ async function saveDiscogsConfig(cfg) {
   try { await redis.set('lyricsync:discogs', cfg); } catch (err) { console.warn('⚠️ Redis discogs write error:', err.message); }
 }
 
+// ─── OAuth 1.0a per Discogs (scrittura campi collezione) ────────────────────
+async function loadDiscogsOAuth() {
+  try {
+    const tokens = await redis.get('lyricsync:discogs:oauth');
+    if (tokens && typeof tokens === 'object' && tokens.accessToken) return tokens;
+  } catch {}
+  return null;
+}
+
+async function saveDiscogsOAuth(tokens) {
+  try { await redis.set('lyricsync:discogs:oauth', tokens); } catch (err) { console.warn('⚠️ Redis discogs oauth write error:', err.message); }
+}
+
+function createOAuthClient(cfg) {
+  return OAuth({
+    consumer: { key: cfg.consumerKey, secret: cfg.consumerSecret },
+    signature_method: 'HMAC-SHA1',
+    hash_function(baseString, key) {
+      return crypto.createHmac('sha1', key).update(baseString).digest('base64');
+    }
+  });
+}
+
+// Temporary storage for request tokens (in memory, short-lived)
+const pendingOAuthTokens = {};
+
+// Step 1: Get request token and return authorization URL
+app.get('/discogs/oauth/start', authMiddleware, async (req, res) => {
+  try {
+    const cfg = await loadDiscogsConfig();
+    if (!cfg) return res.status(400).json({ error: 'Discogs non configurato' });
+
+    const oauth = createOAuthClient(cfg);
+    const requestTokenUrl = 'https://api.discogs.com/oauth/request_token';
+    // callback_url: il frontend aprirà una finestra popup che redirige qui
+    const callbackUrl = req.query.callback || `${req.protocol}://${req.get('host')}/discogs/oauth/callback`;
+
+    const requestData = {
+      url: requestTokenUrl,
+      method: 'GET',
+      data: { oauth_callback: callbackUrl }
+    };
+
+    const authHeader = oauth.toHeader(oauth.authorize(requestData));
+    authHeader['User-Agent'] = 'LyricSync/1.0';
+
+    const response = await fetch(requestTokenUrl + '?oauth_callback=' + encodeURIComponent(callbackUrl), {
+      headers: authHeader
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`❌ Discogs OAuth request token error: ${response.status} ${errText}`);
+      return res.status(response.status).json({ error: 'Errore richiesta token OAuth', details: errText });
+    }
+
+    const body = await response.text();
+    const params = new URLSearchParams(body);
+    const oauthToken = params.get('oauth_token');
+    const oauthTokenSecret = params.get('oauth_token_secret');
+
+    if (!oauthToken || !oauthTokenSecret) {
+      return res.status(500).json({ error: 'Token OAuth non ricevuti da Discogs' });
+    }
+
+    // Salva temporaneamente il token secret (serve per step 3)
+    pendingOAuthTokens[oauthToken] = { secret: oauthTokenSecret, ts: Date.now() };
+    // Pulisci token vecchi (>10 minuti)
+    const now = Date.now();
+    for (const [k, v] of Object.entries(pendingOAuthTokens)) {
+      if (now - v.ts > 600000) delete pendingOAuthTokens[k];
+    }
+
+    const authorizeUrl = `https://www.discogs.com/oauth/authorize?oauth_token=${oauthToken}`;
+    console.log(`🔐 Discogs OAuth: request token ottenuto, redirect a ${authorizeUrl}`);
+    res.json({ authorizeUrl, oauthToken });
+
+  } catch (err) {
+    console.error('❌ Discogs OAuth start error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Step 2: Callback — Discogs redirige qui dopo l'autorizzazione dell'utente
+app.get('/discogs/oauth/callback', async (req, res) => {
+  try {
+    const { oauth_token, oauth_verifier } = req.query;
+    if (!oauth_token || !oauth_verifier) {
+      return res.status(400).send('<html><body><h2>Errore: parametri OAuth mancanti</h2></body></html>');
+    }
+
+    const pending = pendingOAuthTokens[oauth_token];
+    if (!pending) {
+      return res.status(400).send('<html><body><h2>Errore: token OAuth scaduto o non valido. Riprova.</h2></body></html>');
+    }
+
+    const cfg = await loadDiscogsConfig();
+    if (!cfg) {
+      return res.status(400).send('<html><body><h2>Errore: Discogs non configurato</h2></body></html>');
+    }
+
+    const oauth = createOAuthClient(cfg);
+    const accessTokenUrl = 'https://api.discogs.com/oauth/access_token';
+
+    const requestData = {
+      url: accessTokenUrl,
+      method: 'POST',
+      data: { oauth_verifier }
+    };
+
+    const token = { key: oauth_token, secret: pending.secret };
+    const authHeader = oauth.toHeader(oauth.authorize(requestData, token));
+    authHeader['User-Agent'] = 'LyricSync/1.0';
+    authHeader['Content-Type'] = 'application/x-www-form-urlencoded';
+
+    const response = await fetch(accessTokenUrl, {
+      method: 'POST',
+      headers: authHeader,
+      body: `oauth_verifier=${encodeURIComponent(oauth_verifier)}`
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`❌ Discogs OAuth access token error: ${response.status} ${errText}`);
+      return res.status(response.status).send(`<html><body><h2>Errore OAuth: ${response.status}</h2><p>${errText}</p></body></html>`);
+    }
+
+    const body = await response.text();
+    const params = new URLSearchParams(body);
+    const accessToken = params.get('oauth_token');
+    const accessTokenSecret = params.get('oauth_token_secret');
+
+    if (!accessToken || !accessTokenSecret) {
+      return res.status(500).send('<html><body><h2>Errore: access token non ricevuti</h2></body></html>');
+    }
+
+    // Salva i token di accesso su Redis
+    await saveDiscogsOAuth({ accessToken, accessTokenSecret, authorizedAt: new Date().toISOString() });
+    delete pendingOAuthTokens[oauth_token];
+
+    console.log(`🔐 Discogs OAuth: autorizzazione completata! Token salvati.`);
+
+    // Pagina HTML di successo che chiude la finestra popup
+    res.send(`<!DOCTYPE html>
+<html><head><title>LyricSync - Discogs Autorizzato</title>
+<style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e8c97e;}
+.box{text-align:center;}.ok{font-size:3rem;margin-bottom:1rem;}</style></head>
+<body><div class="box"><div class="ok">✅</div><h2>Discogs autorizzato!</h2><p>Puoi chiudere questa finestra.</p>
+<script>setTimeout(()=>{window.close()},2000)</script></div></body></html>`);
+
+  } catch (err) {
+    console.error('❌ Discogs OAuth callback error:', err.message);
+    res.status(500).send(`<html><body><h2>Errore: ${err.message}</h2></body></html>`);
+  }
+});
+
+// Controlla stato OAuth
+app.get('/discogs/oauth/status', authMiddleware, async (req, res) => {
+  const tokens = await loadDiscogsOAuth();
+  if (tokens) {
+    res.json({ authorized: true, authorizedAt: tokens.authorizedAt || '' });
+  } else {
+    res.json({ authorized: false });
+  }
+});
+
+// Revoca OAuth (rimuovi token)
+app.post('/discogs/oauth/revoke', authMiddleware, async (req, res) => {
+  try {
+    await redis.del('lyricsync:discogs:oauth');
+    console.log('🔐 Discogs OAuth: token revocati');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Get/Set config
 app.get('/discogs/config', async (req, res) => {
   const cfg = await loadDiscogsConfig();
@@ -715,7 +894,7 @@ app.get('/discogs/search', async (req, res) => {
   }
 });
 
-// ─── Aggiorna campo personalizzato Discogs (data ascolto) ────────────────────
+// ─── Aggiorna campo personalizzato Discogs (data ascolto) — usa OAuth 1.0a ──
 app.post('/discogs/update-field', authMiddleware, async (req, res) => {
   try {
     const { releaseId, instanceId, folderId, fieldId, value } = req.body;
@@ -725,14 +904,26 @@ app.post('/discogs/update-field', authMiddleware, async (req, res) => {
     const cfg = await loadDiscogsConfig();
     if (!cfg) return res.status(400).json({ error: 'Discogs non configurato' });
 
+    // Controlla se abbiamo token OAuth (necessari per la scrittura)
+    const oauthTokens = await loadDiscogsOAuth();
+    if (!oauthTokens) {
+      console.warn(`⚠️ Discogs update field: OAuth non autorizzato, impossibile scrivere`);
+      return res.json({ success: false, reason: 'oauth_required', message: 'Autorizza Discogs OAuth nelle impostazioni per abilitare la scrittura.' });
+    }
+
     const folder = folderId || 0;
     const url = `https://api.discogs.com/users/${cfg.username}/collection/folders/${folder}/releases/${releaseId}/instances/${instanceId}/fields/${fieldId}`;
-    const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
+
+    // Firma la richiesta con OAuth 1.0a
+    const oauth = createOAuthClient(cfg);
+    const requestData = { url, method: 'POST' };
+    const token = { key: oauthTokens.accessToken, secret: oauthTokens.accessTokenSecret };
+    const oauthHeader = oauth.toHeader(oauth.authorize(requestData, token));
 
     const apiRes = await fetch(url, {
       method: 'POST',
       headers: {
-        'Authorization': authHeader,
+        ...oauthHeader,
         'User-Agent': 'LyricSync/1.0',
         'Content-Type': 'application/json'
       },
@@ -745,9 +936,13 @@ app.post('/discogs/update-field', authMiddleware, async (req, res) => {
     }
 
     const errText = await apiRes.text();
+    if (apiRes.status === 401) {
+      console.warn(`⚠️ Discogs update field 401: token OAuth scaduto o revocato`);
+      return res.json({ success: false, reason: 'oauth_expired', message: 'Token OAuth scaduto. Riautorizza Discogs nelle impostazioni.' });
+    }
     if (apiRes.status === 403) {
-      console.warn(`⚠️ Discogs update field 403: scrittura richiede OAuth 1.0a con token utente (consumer key/secret non basta)`);
-      return res.json({ success: false, reason: 'oauth_required', message: 'Discogs richiede OAuth 1.0a per la scrittura. Funzionalità non ancora disponibile.' });
+      console.warn(`⚠️ Discogs update field 403: ${errText}`);
+      return res.json({ success: false, reason: 'oauth_required', message: 'Errore autorizzazione Discogs. Riprova l\'autorizzazione OAuth.' });
     }
     console.error(`❌ Discogs update field error: ${apiRes.status} ${errText}`);
     res.status(apiRes.status).json({ error: `Discogs API error: ${apiRes.status}`, details: errText });
