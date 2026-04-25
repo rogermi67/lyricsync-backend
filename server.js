@@ -478,8 +478,27 @@ function createOAuthClient(cfg) {
   });
 }
 
-// Temporary storage for request tokens (in memory, short-lived)
-const pendingOAuthTokens = {};
+// Temporary storage for request tokens (Redis, sopravvive ai restart del server)
+async function savePendingOAuthToken(oauthToken, secret) {
+  try {
+    await redis.set(`lyricsync:discogs:pending:${oauthToken}`, JSON.stringify({ secret, ts: Date.now() }));
+    // Scade dopo 10 minuti
+    await redis.expire(`lyricsync:discogs:pending:${oauthToken}`, 600);
+  } catch (err) { console.warn('⚠️ Redis pending oauth write error:', err.message); }
+}
+
+async function getPendingOAuthToken(oauthToken) {
+  try {
+    const data = await redis.get(`lyricsync:discogs:pending:${oauthToken}`);
+    if (!data) return null;
+    const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+    return parsed;
+  } catch { return null; }
+}
+
+async function deletePendingOAuthToken(oauthToken) {
+  try { await redis.del(`lyricsync:discogs:pending:${oauthToken}`); } catch {}
+}
 
 // Step 1: Get request token and return authorization URL
 app.get('/discogs/oauth/start', authMiddleware, async (req, res) => {
@@ -520,13 +539,8 @@ app.get('/discogs/oauth/start', authMiddleware, async (req, res) => {
       return res.status(500).json({ error: 'Token OAuth non ricevuti da Discogs' });
     }
 
-    // Salva temporaneamente il token secret (serve per step 3)
-    pendingOAuthTokens[oauthToken] = { secret: oauthTokenSecret, ts: Date.now() };
-    // Pulisci token vecchi (>10 minuti)
-    const now = Date.now();
-    for (const [k, v] of Object.entries(pendingOAuthTokens)) {
-      if (now - v.ts > 600000) delete pendingOAuthTokens[k];
-    }
+    // Salva temporaneamente il token secret su Redis (serve per step 3, scade in 10 min)
+    await savePendingOAuthToken(oauthToken, oauthTokenSecret);
 
     const authorizeUrl = `https://www.discogs.com/oauth/authorize?oauth_token=${oauthToken}`;
     console.log(`🔐 Discogs OAuth: request token ottenuto, redirect a ${authorizeUrl}`);
@@ -546,7 +560,7 @@ app.get('/discogs/oauth/callback', async (req, res) => {
       return res.status(400).send('<html><body><h2>Errore: parametri OAuth mancanti</h2></body></html>');
     }
 
-    const pending = pendingOAuthTokens[oauth_token];
+    const pending = await getPendingOAuthToken(oauth_token);
     if (!pending) {
       return res.status(400).send('<html><body><h2>Errore: token OAuth scaduto o non valido. Riprova.</h2></body></html>');
     }
@@ -593,7 +607,7 @@ app.get('/discogs/oauth/callback', async (req, res) => {
 
     // Salva i token di accesso su Redis
     await saveDiscogsOAuth({ accessToken, accessTokenSecret, authorizedAt: new Date().toISOString() });
-    delete pendingOAuthTokens[oauth_token];
+    await deletePendingOAuthToken(oauth_token);
 
     console.log(`🔐 Discogs OAuth: autorizzazione completata! Token salvati.`);
 
