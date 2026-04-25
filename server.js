@@ -971,6 +971,176 @@ app.post('/discogs/update-field', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Immagini release Discogs (per galleria) ────────────────────────────────
+app.get('/discogs/images/:releaseId', authMiddleware, async (req, res) => {
+  try {
+    const { releaseId } = req.params;
+    const cfg = await loadDiscogsConfig();
+    if (!cfg) return res.json({ images: [] });
+
+    const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
+    const apiRes = await fetch(`https://api.discogs.com/releases/${releaseId}`, {
+      headers: { 'Authorization': authHeader, 'User-Agent': 'LyricSync/1.0' }
+    });
+    if (!apiRes.ok) return res.json({ images: [] });
+
+    const data = await apiRes.json();
+    const images = (data.images || []).map(img => ({
+      type: img.type || 'secondary',  // primary, secondary
+      uri: img.uri || img.resource_url || '',
+      uri150: img.uri150 || '',
+      width: img.width || 0,
+      height: img.height || 0
+    })).filter(img => img.uri);
+
+    console.log(`🖼️ Discogs: ${images.length} immagini per release ${releaseId}`);
+    res.json({ images });
+  } catch (err) {
+    console.error('❌ Discogs images error:', err.message);
+    res.json({ images: [] });
+  }
+});
+
+// ─── Info artista da Wikipedia IT ───────────────────────────────────────────
+app.get('/artist/info', authMiddleware, async (req, res) => {
+  try {
+    const { artist } = req.query;
+    if (!artist) return res.status(400).json({ error: 'Parametro artist mancante' });
+
+    // Step 1: cerca l'artista su Wikipedia IT
+    const searchUrl = `https://it.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(artist + ' musicista OR cantante OR band OR gruppo musicale')}&format=json&srlimit=5&utf8=1`;
+    const searchRes = await fetch(searchUrl, { headers: { 'User-Agent': 'LyricSync/1.0' } });
+    const searchData = await searchRes.json();
+
+    if (!searchData.query?.search?.length) {
+      // Prova senza filtro genere
+      const fallbackUrl = `https://it.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(artist)}&format=json&srlimit=3&utf8=1`;
+      const fallbackRes = await fetch(fallbackUrl, { headers: { 'User-Agent': 'LyricSync/1.0' } });
+      const fallbackData = await fallbackRes.json();
+      if (!fallbackData.query?.search?.length) {
+        return res.json({ found: false });
+      }
+      searchData.query.search = fallbackData.query.search;
+    }
+
+    // Prendi il primo risultato
+    const pageTitle = searchData.query.search[0].title;
+
+    // Step 2: ottieni l'estratto della pagina
+    const extractUrl = `https://it.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(pageTitle)}&prop=extracts|pageimages&exintro=false&explaintext=true&exsectionformat=plain&pithumbsize=400&format=json&utf8=1`;
+    const extractRes = await fetch(extractUrl, { headers: { 'User-Agent': 'LyricSync/1.0' } });
+    const extractData = await extractRes.json();
+
+    const pages = extractData.query?.pages || {};
+    const page = Object.values(pages)[0];
+    if (!page || page.missing !== undefined) {
+      return res.json({ found: false });
+    }
+
+    // Limita il testo a ~3000 caratteri per non appesantire il frontend
+    let extract = page.extract || '';
+    if (extract.length > 3000) {
+      extract = extract.substring(0, 3000);
+      const lastPeriod = extract.lastIndexOf('.');
+      if (lastPeriod > 2000) extract = extract.substring(0, lastPeriod + 1);
+      extract += '\n\n[...]';
+    }
+
+    const wikiUrl = `https://it.wikipedia.org/wiki/${encodeURIComponent(pageTitle.replace(/ /g, '_'))}`;
+    console.log(`📖 Wikipedia IT: "${pageTitle}" (${extract.length} chars)`);
+
+    res.json({
+      found: true,
+      title: pageTitle,
+      extract,
+      image: page.thumbnail?.source || null,
+      wikiUrl
+    });
+
+  } catch (err) {
+    console.error('❌ Artist info error:', err.message);
+    res.json({ found: false, error: err.message });
+  }
+});
+
+// ─── Discografia artista da Discogs con evidenza collezione ─────────────────
+app.get('/discogs/discography', authMiddleware, async (req, res) => {
+  try {
+    const { artist } = req.query;
+    if (!artist) return res.status(400).json({ error: 'Parametro artist mancante' });
+
+    const cfg = await loadDiscogsConfig();
+    if (!cfg) return res.json({ releases: [], collection: [] });
+
+    const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
+    const userAgent = 'LyricSync/1.0';
+
+    // Step 1: cerca l'artista su Discogs per ottenere l'ID
+    const searchUrl = `https://api.discogs.com/database/search?q=${encodeURIComponent(artist)}&type=artist&per_page=5`;
+    const searchRes = await fetch(searchUrl, {
+      headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
+    });
+    if (!searchRes.ok) return res.json({ releases: [], collection: [] });
+
+    const searchData = await searchRes.json();
+    if (!searchData.results?.length) return res.json({ releases: [], collection: [] });
+
+    const artistId = searchData.results[0].id;
+    const artistName = searchData.results[0].title;
+
+    // Step 2: ottieni le release dell'artista (solo album principali)
+    const releasesUrl = `https://api.discogs.com/artists/${artistId}/releases?sort=year&sort_order=asc&per_page=100&page=1`;
+    const releasesRes = await fetch(releasesUrl, {
+      headers: { 'Authorization': authHeader, 'User-Agent': userAgent }
+    });
+    if (!releasesRes.ok) return res.json({ releases: [], collection: [] });
+
+    const releasesData = await releasesRes.json();
+
+    // Filtra per album principali (tipo "master" o releases con ruolo "Main")
+    const releases = (releasesData.releases || [])
+      .filter(r => r.role === 'Main' && r.type === 'master')
+      .map(r => ({
+        id: r.id,
+        title: r.title || '',
+        year: r.year || 0,
+        thumb: r.thumb || '',
+        format: r.format || '',
+        type: r.type || '',
+        resourceUrl: r.resource_url || ''
+      }));
+
+    // Step 3: carica la collezione e trova quali album sono presenti
+    const collection = await loadFullCollection(cfg);
+    const collectionTitles = new Set();
+    const collectionIds = new Set();
+    collection.forEach(r => {
+      collectionTitles.add(r.title.toLowerCase().replace(/[^a-z0-9]/g, ''));
+      collectionIds.add(r.id);
+    });
+
+    // Evidenzia quali release sono nella collezione
+    const enriched = releases.map(r => {
+      const titleNorm = r.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const inCollection = collectionIds.has(r.id) || collectionTitles.has(titleNorm);
+      return { ...r, inCollection };
+    });
+
+    console.log(`📀 Discografia: ${artistName} — ${enriched.length} album, ${enriched.filter(r => r.inCollection).length} in collezione`);
+
+    res.json({
+      artist: artistName,
+      artistId,
+      releases: enriched,
+      totalInCollection: enriched.filter(r => r.inCollection).length
+    });
+
+  } catch (err) {
+    console.error('❌ Discography error:', err.message);
+    res.json({ releases: [], collection: [], error: err.message });
+  }
+});
+
 // ─── Gestione chiavi API da frontend ─────────────────────────────────────────
 app.use('/keys', authMiddleware);
 
