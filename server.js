@@ -955,15 +955,11 @@ app.post('/discogs/update-field', authMiddleware, async (req, res) => {
     const url = `https://api.discogs.com/users/${cfg.username}/collection/folders/${folder}/releases/${releaseId}/instances/${instanceId}/fields/${fieldId}`;
 
     // Firma la richiesta con OAuth 1.0a
-    // IMPORTANTE: i parametri del body form-urlencoded DEVONO essere inclusi nella firma
+    // Per endpoint JSON: il body NON viene incluso nella firma OAuth
     const oauth = createOAuthClient(cfg);
-    const bodyData = { value: String(value) };
-    const requestData = { url, method: 'POST', data: bodyData };
+    const requestData = { url, method: 'POST' };
     const token = { key: oauthTokens.accessToken, secret: oauthTokens.accessTokenSecret };
     const oauthHeader = oauth.toHeader(oauth.authorize(requestData, token));
-
-    // Body come form-urlencoded
-    const bodyStr = new URLSearchParams(bodyData).toString();
 
     console.log(`💿 Discogs update: POST ${url}`);
     console.log(`💿 Discogs update: OAuth token=${oauthTokens.accessToken.substring(0, 8)}...`);
@@ -973,9 +969,9 @@ app.post('/discogs/update-field', authMiddleware, async (req, res) => {
       headers: {
         ...oauthHeader,
         'User-Agent': 'LyricSync/1.0',
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/json'
       },
-      body: bodyStr
+      body: JSON.stringify({ value: String(value) })
     });
 
     console.log(`💿 Discogs update response: ${apiRes.status}`);
