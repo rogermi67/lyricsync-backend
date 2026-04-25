@@ -437,7 +437,11 @@ app.post('/counter/reset', async (req, res) => {
 });
 
 // ─── Discogs integration ────────────────────────────────────────────────────
-app.use('/discogs', authMiddleware);
+// Auth su tutte le route /discogs TRANNE /discogs/oauth/callback (redirect da Discogs, senza header)
+app.use('/discogs', (req, res, next) => {
+  if (req.path === '/oauth/callback') return next();
+  authMiddleware(req, res, next);
+});
 
 // Carica/salva config Discogs su Redis
 async function loadDiscogsConfig() {
