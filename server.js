@@ -878,7 +878,7 @@ app.get('/discogs/search', async (req, res) => {
         inCollection: true,
         releaseId: best.id,
         instanceId: best.instanceId,
-        folderId: best.folderId || 0,
+        folderId: best.folderId || 1,  // folder 0 = "All" (virtuale, non scrivibile), 1 = "Uncategorized" (default reale)
         title: best.title || '',
         artist: best.artists.join(', ') || '',
         year: best.year || '',
@@ -891,7 +891,7 @@ app.get('/discogs/search', async (req, res) => {
         rating: best.rating || 0,
         tracklist
       };
-      console.log(`💿 Discogs: "${result.title}" IN COLLEZIONE (${result.label}, ${result.year}, notes: ${notes.length}, tracks: ${tracklist.length})`);
+      console.log(`💿 Discogs: "${result.title}" IN COLLEZIONE (${result.label}, ${result.year}, folder: ${result.folderId}, instance: ${result.instanceId}, notes: ${notes.length}, tracks: ${tracklist.length})`);
       return res.json(result);
     }
 
@@ -950,7 +950,8 @@ app.post('/discogs/update-field', authMiddleware, async (req, res) => {
       return res.json({ success: false, reason: 'oauth_required', message: 'Autorizza Discogs OAuth nelle impostazioni per abilitare la scrittura.' });
     }
 
-    const folder = folderId || 0;
+    const folder = folderId || 1;  // Mai usare folder 0 ("All"), default a 1 ("Uncategorized")
+    console.log(`💿 Discogs update: folderId ricevuto=${folderId}, usato=${folder}, release=${releaseId}, instance=${instanceId}, field=${fieldId}`);
     const url = `https://api.discogs.com/users/${cfg.username}/collection/folders/${folder}/releases/${releaseId}/instances/${instanceId}/fields/${fieldId}`;
 
     // Firma la richiesta con OAuth 1.0a
