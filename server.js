@@ -203,6 +203,7 @@ app.post('/recognize', upload.single('audio'), async (req, res) => {
   let convertedPath = null;
   try {
     if (!req.file) return res.status(400).json({ error: 'Nessun file audio' });
+    console.log(`🎙️ Audio ricevuto: ${(req.file.size / 1024).toFixed(0)}KB, tipo: ${req.file.mimetype || 'unknown'}`);
 
     // Trova chiave disponibile
     let activeKey = await getActiveKey();
