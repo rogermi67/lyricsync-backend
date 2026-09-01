@@ -3,10 +3,20 @@ services:
     name: lyricsync-backend
     runtime: node
     plan: free
+    region: frankfurt
     buildCommand: npm install
     startCommand: node server.js
+    healthCheckPath: /
     envVars:
+      # I valori si inseriscono nella dashboard di Render:
+      # sync:false li tiene fuori dal repo, che è pubblico
       - key: RAPIDAPI_KEY
+        sync: false
+      - key: UPSTASH_REDIS_URL
+        sync: false
+      - key: UPSTASH_REDIS_TOKEN
+        sync: false
+      - key: APP_PASSWORD
         sync: false
       - key: NODE_ENV
         value: production

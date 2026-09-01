@@ -299,35 +299,324 @@ app.post('/recognize', upload.single('audio'), async (req, res) => {
   }
 });
 
+// ─── Cache testi su Redis ───────────────────────────────────────────────────
+const LYRICS_TTL_FOUND = 60 * 60 * 24 * 180;  // 180 giorni per i testi trovati
+const LYRICS_TTL_MISS = 60 * 60 * 24 * 7;     // 7 giorni per i "non trovato"
+
+// Normalizza artista/titolo per costruire una chiave stabile
+function normKeyPart(s) {
+  return (s || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   // accenti
+    .replace(/\(.*?\)|\[.*?\]/g, ' ')                    // (Remastered), [Live]...
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .substring(0, 80);
+}
+
+function lyricsKey(artist, title) {
+  return `lyricsync:lyrics:${normKeyPart(artist)}:${normKeyPart(title)}`;
+}
+
+async function getCachedLyrics(artist, title) {
+  try {
+    const data = await redis.get(lyricsKey(artist, title));
+    if (!data) return null;
+    if (typeof data === 'string') { try { return JSON.parse(data); } catch { return null; } }
+    if (typeof data === 'object') return data;
+  } catch (err) { console.warn('⚠️ Redis lyrics read error:', err.message); }
+  return null;
+}
+
+async function setCachedLyrics(artist, title, payload) {
+  try {
+    const ttl = payload && payload.found ? LYRICS_TTL_FOUND : LYRICS_TTL_MISS;
+    await redis.set(lyricsKey(artist, title), payload, { ex: ttl });
+  } catch (err) { console.warn('⚠️ Redis lyrics write error:', err.message); }
+}
+
+// Scarica i testi da lrclib (get esatto, poi ricerca come fallback)
+async function fetchLyricsFromProvider(title, artist, album) {
+  let url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(title)}&artist_name=${encodeURIComponent(artist)}`;
+  if (album) url += `&album_name=${encodeURIComponent(album)}`;
+  const response = await fetch(url);
+
+  if (response.ok) {
+    const data = await response.json();
+    return {
+      found: true,
+      syncedLyrics: data.syncedLyrics || null,
+      plainLyrics: data.plainLyrics || null
+    };
+  }
+
+  const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(title + ' ' + artist)}`;
+  const searchRes = await fetch(searchUrl);
+  if (searchRes.ok) {
+    const results = await searchRes.json();
+    if (Array.isArray(results) && results.length > 0) {
+      // Preferisci un risultato con testo sincronizzato, se c'è
+      const best = results.find(r => r.syncedLyrics) || results[0];
+      return {
+        found: true,
+        syncedLyrics: best.syncedLyrics || null,
+        plainLyrics: best.plainLyrics || null
+      };
+    }
+  }
+  return { found: false, syncedLyrics: null, plainLyrics: null };
+}
+
+// Testi con cache Redis: prima la cache, poi lrclib
+async function getLyrics(title, artist, album) {
+  const cached = await getCachedLyrics(artist, title);
+  if (cached) {
+    console.log(`💾 Cache Redis hit: "${title}" - "${artist}" (found: ${cached.found})`);
+    return { ...cached, cached: true };
+  }
+  const result = await fetchLyricsFromProvider(title, artist, album);
+  await setCachedLyrics(artist, title, result);
+  return { ...result, cached: false };
+}
+
 app.get('/lyrics', async (req, res) => {
   try {
     const { title, artist, album } = req.query;
     if (!title || !artist) return res.status(400).json({ error: 'Parametri mancanti' });
     console.log(`🔍 Cerco testi: "${title}" - "${artist}"`);
 
-    let url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(title)}&artist_name=${encodeURIComponent(artist)}`;
-    if (album) url += `&album_name=${encodeURIComponent(album)}`;
-    let response = await fetch(url);
-    console.log('📬 lrclib get:', response.status);
-
-    if (!response.ok) {
-      const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(title + ' ' + artist)}`;
-      const searchRes = await fetch(searchUrl);
-      if (searchRes.ok) {
-        const results = await searchRes.json();
-        if (results.length > 0) {
-          return res.json({ found: true, syncedLyrics: results[0].syncedLyrics || null, plainLyrics: results[0].plainLyrics || null });
-        }
-      }
-      return res.json({ found: false });
-    }
-
-    const data = await response.json();
-    console.log(`✅ Testo trovato, synced: ${!!data.syncedLyrics}`);
-    res.json({ found: true, syncedLyrics: data.syncedLyrics || null, plainLyrics: data.plainLyrics || null });
+    const result = await getLyrics(title, artist, album);
+    if (result.found) console.log(`✅ Testo trovato, synced: ${!!result.syncedLyrics}, da cache: ${result.cached}`);
+    else console.log(`❌ Testo non trovato per "${title}"`);
+    res.json(result);
 
   } catch (err) {
     console.error('❌ Errore lyrics:', err.message);
+    res.status(500).json({ error: 'Errore interno' });
+  }
+});
+
+// ─── Prefetch testi di un intero album ──────────────────────────────────────
+const PREFETCH_CONCURRENCY = 4;              // richieste lrclib in parallelo
+const PREFETCH_JOB_TTL = 60 * 60 * 6;        // 6 ore di vita per lo stato del job
+const prefetchJobs = new Map();              // cache in memoria: jobId -> stato
+
+function prefetchJobId(artist, album) {
+  return `${normKeyPart(artist)}:${normKeyPart(album)}`;
+}
+function prefetchJobKey(jobId) {
+  return `lyricsync:prefetch:${jobId}`;
+}
+
+async function saveJobState(state) {
+  prefetchJobs.set(state.jobId, state);
+  try {
+    await redis.set(prefetchJobKey(state.jobId), state, { ex: PREFETCH_JOB_TTL });
+  } catch (err) { console.warn('⚠️ Redis prefetch write error:', err.message); }
+}
+
+async function loadJobState(jobId) {
+  const mem = prefetchJobs.get(jobId);
+  if (mem) return mem;
+  try {
+    const data = await redis.get(prefetchJobKey(jobId));
+    if (!data) return null;
+    const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+    if (parsed && parsed.jobId) {
+      // Un job rimasto "running" da più di 5 minuti è morto (restart del server)
+      if (parsed.running && Date.now() - (parsed.startedAt || 0) > 300000) parsed.running = false;
+      prefetchJobs.set(jobId, parsed);
+      return parsed;
+    }
+  } catch { }
+  return null;
+}
+
+// Trova la tracklist di un album: prima per releaseId, poi nella collezione, poi sul database Discogs
+async function resolveAlbumTracklist({ artist, album, releaseId }) {
+  const cfg = await loadDiscogsConfig();
+  if (!cfg) return { releaseId: null, tracks: [], reason: 'Discogs non configurato' };
+
+  const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
+  const headers = { 'Authorization': authHeader, 'User-Agent': 'LyricSync/1.0' };
+
+  let id = releaseId ? String(releaseId) : null;
+
+  // 1) Cerca l'album nella collezione già in cache (nessuna chiamata API)
+  if (!id && album) {
+    try {
+      const collection = await loadFullCollection(cfg);
+      const artistNorm = (artist || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const albumNorm = album.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const match = collection.find(r => {
+        const titleNorm = r.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const titleOk = titleNorm === albumNorm ||
+          (albumNorm.length >= 4 && (titleNorm.includes(albumNorm) || albumNorm.includes(titleNorm)));
+        if (!titleOk) return false;
+        if (!artistNorm) return true;
+        return r.artists.some(a => {
+          const aN = a.toLowerCase().replace(/[^a-z0-9]/g, '');
+          return aN === artistNorm || aN.includes(artistNorm) || artistNorm.includes(aN);
+        });
+      });
+      if (match) {
+        id = String(match.id);
+        console.log(`📀 Prefetch: album "${album}" trovato in collezione (release ${id})`);
+      }
+    } catch (e) { console.warn('⚠️ Prefetch collection lookup error:', e.message); }
+  }
+
+  // 2) Fallback: cerca sul database Discogs
+  if (!id && album) {
+    try {
+      const q = `${artist || ''} ${album}`.trim();
+      const searchUrl = `https://api.discogs.com/database/search?q=${encodeURIComponent(q)}&type=release&per_page=1`;
+      const sRes = await fetch(searchUrl, { headers });
+      if (sRes.ok) {
+        const sData = await sRes.json();
+        if (sData.results?.length > 0) {
+          id = String(sData.results[0].id);
+          console.log(`📀 Prefetch: album "${album}" trovato sul database Discogs (release ${id})`);
+        }
+      }
+    } catch (e) { console.warn('⚠️ Prefetch discogs search error:', e.message); }
+  }
+
+  if (!id) return { releaseId: null, tracks: [], reason: 'Album non trovato su Discogs' };
+
+  // 3) Scarica la tracklist della release
+  try {
+    const rRes = await fetch(`https://api.discogs.com/releases/${id}`, { headers });
+    if (!rRes.ok) return { releaseId: id, tracks: [], reason: `Discogs release ${rRes.status}` };
+    const rData = await rRes.json();
+    const tracks = (rData.tracklist || [])
+      .filter(t => t.type_ === 'track' && t.title)
+      .map(t => ({
+        position: t.position || '',
+        title: t.title.trim(),
+        duration: t.duration || ''
+      }));
+    return { releaseId: id, tracks, reason: null };
+  } catch (e) {
+    return { releaseId: id, tracks: [], reason: e.message };
+  }
+}
+
+// Esegue il prefetch in background con un pool di worker
+async function runPrefetch(state, artist) {
+  const tracks = state.tracks;
+  let cursor = 0;
+  let lastSave = 0;
+
+  const flush = async (force = false) => {
+    const now = Date.now();
+    if (force || now - lastSave > 900) { lastSave = now; await saveJobState(state); }
+  };
+
+  async function worker() {
+    while (cursor < tracks.length) {
+      const i = cursor++;
+      const t = tracks[i];
+      try {
+        const cached = await getCachedLyrics(artist, t.title);
+        if (cached) {
+          t.status = cached.found ? 'ready' : 'missing';
+          t.synced = !!cached.syncedLyrics;
+        } else {
+          const result = await fetchLyricsFromProvider(t.title, artist, state.album);
+          await setCachedLyrics(artist, t.title, result);
+          t.status = result.found ? 'ready' : 'missing';
+          t.synced = !!result.syncedLyrics;
+        }
+      } catch (e) {
+        t.status = 'error';
+        console.warn(`⚠️ Prefetch "${t.title}": ${e.message}`);
+      }
+      state.done++;
+      await flush();
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(PREFETCH_CONCURRENCY, tracks.length) }, () => worker());
+  await Promise.all(workers);
+
+  state.running = false;
+  state.finishedAt = Date.now();
+  const ready = tracks.filter(t => t.status === 'ready').length;
+  console.log(`📀 Prefetch completato "${state.album}": ${ready}/${tracks.length} testi disponibili in ${((state.finishedAt - state.startedAt) / 1000).toFixed(1)}s`);
+  await flush(true);
+}
+
+// Avvia (o riprende) il prefetch dei testi di un album — risponde subito, lavora in background
+app.get('/lyrics/prefetch', async (req, res) => {
+  try {
+    const { artist, album, releaseId, force } = req.query;
+    if (!artist || !album) return res.status(400).json({ error: 'Parametri mancanti (artist, album)' });
+
+    const jobId = prefetchJobId(artist, album);
+    const existing = await loadJobState(jobId);
+
+    // Job già in corso o già completato di recente: restituisci lo stato senza rifare nulla
+    if (existing && force !== '1') {
+      if (existing.running) return res.json({ ...existing, resumed: true });
+      const pending = existing.tracks.some(t => t.status === 'pending' || t.status === 'error');
+      if (!pending) return res.json({ ...existing, resumed: true });
+    }
+
+    const { releaseId: resolvedId, tracks, reason } = await resolveAlbumTracklist({ artist, album, releaseId });
+    if (tracks.length === 0) {
+      const empty = {
+        jobId, artist, album, releaseId: resolvedId,
+        total: 0, done: 0, running: false, tracks: [],
+        startedAt: Date.now(), finishedAt: Date.now(), reason
+      };
+      console.log(`📀 Prefetch "${album}": nessuna traccia (${reason || 'tracklist vuota'})`);
+      return res.json(empty);
+    }
+
+    const state = {
+      jobId,
+      artist,
+      album,
+      releaseId: resolvedId,
+      total: tracks.length,
+      done: 0,
+      running: true,
+      startedAt: Date.now(),
+      finishedAt: null,
+      reason: null,
+      tracks: tracks.map(t => ({ ...t, status: 'pending', synced: false }))
+    };
+
+    await saveJobState(state);
+    console.log(`📀 Prefetch avviato "${album}" (${artist}): ${tracks.length} tracce`);
+
+    // Non aspettare: il lavoro continua dopo la risposta
+    runPrefetch(state, artist).catch(err => {
+      console.error('❌ Prefetch error:', err.message);
+      state.running = false;
+      state.reason = err.message;
+      saveJobState(state);
+    });
+
+    res.json(state);
+
+  } catch (err) {
+    console.error('❌ Errore prefetch:', err.message);
+    res.status(500).json({ error: 'Errore interno' });
+  }
+});
+
+// Stato del prefetch — il frontend fa polling qui per aggiornare i pallini
+app.get('/lyrics/prefetch/status', async (req, res) => {
+  try {
+    const { artist, album } = req.query;
+    if (!artist || !album) return res.status(400).json({ error: 'Parametri mancanti (artist, album)' });
+    const state = await loadJobState(prefetchJobId(artist, album));
+    if (!state) return res.json({ found: false, running: false, tracks: [], total: 0, done: 0 });
+    res.json({ found: true, ...state });
+  } catch (err) {
+    console.error('❌ Errore prefetch status:', err.message);
     res.status(500).json({ error: 'Errore interno' });
   }
 });
