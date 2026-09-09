@@ -318,6 +318,57 @@ function lyricsKey(artist, title) {
   return `lyricsync:lyrics:${normKeyPart(artist)}:${normKeyPart(title)}`;
 }
 
+// ─── Normalizzazione titoli e artisti per il matching ───────────────────────
+// Suffissi da rimuovere dai titoli prima di confrontarli o cercarli su lrclib
+const TITLE_SUFFIX_RE = new RegExp(
+  '\\s*(?:' +
+  '[\\(\\[][^\\)\\]]*(?:live|remaster(?:ed)?|remix|mono|stereo|edit|version|mix|take|demo|' +
+  'alternate|acoustic|single|album|radio|extended|bonus|reprise|instrumental|' +
+  'session|outtake|rehearsal|unplugged|deluxe|anniversary|expanded)[^\\)\\]]*[\\)\\]]' +
+  '|' +
+  '[-–—]\\s*(?:\\d{4}\\s*)?(?:[a-z0-9\']+\\s+){0,2}(?:live|remaster(?:ed)?|remix|mono|stereo|edit|version|mix|take|demo|' +
+  'alternate|acoustic|single|album|radio|extended|bonus|instrumental|' +
+  'session|outtake|unplugged|deluxe|anniversary|expanded)\\b.*$' +
+  ')', 'gi'
+);
+
+// Rimuove featuring, suffissi live/remaster e punteggiatura: "Glorified G (Live)" -> "glorifiedg"
+function normTitle(s) {
+  return (s || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s*(?:feat\.?|ft\.?|featuring|with)\s+[^\(\)\[\]-]*/gi, ' ')
+    .replace(TITLE_SUFFIX_RE, ' ')
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+// Versione "pulita" del titolo ma leggibile, da usare nelle query a lrclib
+function cleanTitle(s) {
+  return (s || '')
+    .replace(/\s*(?:feat\.?|ft\.?|featuring)\s+[^\(\)\[\]]*/gi, ' ')
+    .replace(TITLE_SUFFIX_RE, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+// Normalizza il nome artista: "The Rah Band" -> "rahband"
+function normArtist(s) {
+  return (s || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/^the\s+/, '')
+    .replace(/\s*\(\d+\)\s*$/, '')
+    .replace(/\s*(?:&|and|feat\.?|ft\.?|featuring|with)\s+.*$/i, '')
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+// True se due nomi artista sono la stessa entità (match esatto sul nome normalizzato)
+function sameArtist(a, b) {
+  const x = normArtist(a), y = normArtist(b);
+  if (!x || !y) return false;
+  return x === y;
+}
+
 async function getCachedLyrics(artist, title) {
   try {
     const data = await redis.get(lyricsKey(artist, title));
@@ -337,33 +388,65 @@ async function setCachedLyrics(artist, title, payload) {
 
 // Scarica i testi da lrclib (get esatto, poi ricerca come fallback)
 async function fetchLyricsFromProvider(title, artist, album) {
-  let url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(title)}&artist_name=${encodeURIComponent(artist)}`;
-  if (album) url += `&album_name=${encodeURIComponent(album)}`;
-  const response = await fetch(url);
-
-  if (response.ok) {
-    const data = await response.json();
-    return {
-      found: true,
-      syncedLyrics: data.syncedLyrics || null,
-      plainLyrics: data.plainLyrics || null
-    };
+  // Varianti di titolo da provare: originale, poi ripulito da (Live)/(Remastered)/- 2016 Remaster
+  const bare = cleanTitle(title);
+  const titleVariants = [title];
+  if (bare && normTitle(bare) !== normTitle('') && bare.toLowerCase() !== title.toLowerCase()) {
+    titleVariants.push(bare);
   }
 
-  const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(title + ' ' + artist)}`;
-  const searchRes = await fetch(searchUrl);
-  if (searchRes.ok) {
-    const results = await searchRes.json();
-    if (Array.isArray(results) && results.length > 0) {
-      // Preferisci un risultato con testo sincronizzato, se c'è
-      const best = results.find(r => r.syncedLyrics) || results[0];
+  // 1) get esatto — con album, poi senza (l'album del vinile spesso non coincide con lrclib)
+  for (const t of titleVariants) {
+    const attempts = album ? [album, null] : [null];
+    for (const alb of attempts) {
+      let url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(t)}&artist_name=${encodeURIComponent(artist)}`;
+      if (alb) url += `&album_name=${encodeURIComponent(alb)}`;
+      try {
+        const response = await fetch(url);
+        if (response.ok) {
+          const data = await response.json();
+          if (data.syncedLyrics || data.plainLyrics) {
+            if (t !== title) console.log(`📝 lrclib: trovato con titolo ripulito "${t}" (era "${title}")`);
+            return {
+              found: true,
+              syncedLyrics: data.syncedLyrics || null,
+              plainLyrics: data.plainLyrics || null
+            };
+          }
+        }
+      } catch (e) { console.warn(`⚠️ lrclib get "${t}": ${e.message}`); }
+    }
+  }
+
+  // 2) ricerca libera, verificando che l'artista del risultato sia davvero quello giusto
+  for (const t of titleVariants) {
+    try {
+      const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(t + ' ' + artist)}`;
+      const searchRes = await fetch(searchUrl);
+      if (!searchRes.ok) continue;
+      const results = await searchRes.json();
+      if (!Array.isArray(results) || results.length === 0) continue;
+
+      const wantTitle = normTitle(t);
+      const plausible = results.filter(r =>
+        sameArtist(r.artistName, artist) &&
+        (normTitle(r.trackName) === wantTitle ||
+         normTitle(r.trackName).includes(wantTitle) ||
+         wantTitle.includes(normTitle(r.trackName)))
+      );
+      const pool = plausible.length ? plausible : [];
+      if (!pool.length) continue;
+
+      const best = pool.find(r => r.syncedLyrics) || pool[0];
+      if (t !== title) console.log(`📝 lrclib: trovato via search con "${t}" (era "${title}")`);
       return {
         found: true,
         syncedLyrics: best.syncedLyrics || null,
         plainLyrics: best.plainLyrics || null
       };
-    }
+    } catch (e) { console.warn(`⚠️ lrclib search "${t}": ${e.message}`); }
   }
+
   return { found: false, syncedLyrics: null, plainLyrics: null };
 }
 
@@ -432,6 +515,61 @@ async function loadJobState(jobId) {
   return null;
 }
 
+// ─── Tracklist di una release, con cache Redis (le tracklist non cambiano mai) ─
+const TRACKLIST_TTL = 60 * 60 * 24 * 365;   // 1 anno
+
+async function fetchReleaseTracklist(releaseId, cfg) {
+  const id = String(releaseId);
+  const key = `lyricsync:tracklist:${id}`;
+  try {
+    const cached = await redis.get(key);
+    if (cached) {
+      const parsed = typeof cached === 'string' ? JSON.parse(cached) : cached;
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch { }
+
+  try {
+    const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
+    const res = await fetch(`https://api.discogs.com/releases/${id}`, {
+      headers: { 'Authorization': authHeader, 'User-Agent': 'LyricSync/1.0' }
+    });
+    if (!res.ok) {
+      console.warn(`⚠️ Tracklist release ${id}: HTTP ${res.status}`);
+      return [];
+    }
+    const data = await res.json();
+    const tracks = (data.tracklist || [])
+      .filter(t => t.type_ === 'track' && t.title)
+      .map(t => ({
+        position: t.position || '',
+        title: String(t.title).trim(),
+        duration: t.duration || ''
+      }));
+    try { await redis.set(key, tracks, { ex: TRACKLIST_TTL }); } catch { }
+    return tracks;
+  } catch (e) {
+    console.warn(`⚠️ Tracklist release ${id}: ${e.message}`);
+    return [];
+  }
+}
+
+// True se il brano riconosciuto compare nella tracklist (confronto normalizzato)
+function tracklistHasTrack(tracks, title) {
+  const want = normTitle(title);
+  if (!want || !Array.isArray(tracks) || tracks.length === 0) return false;
+  return tracks.some(t => {
+    const have = normTitle(t.title);
+    if (!have) return false;
+    if (have === want) return true;
+    // Tolleranza per titoli lunghi (es. "Working John, Working Joe" vs varianti)
+    if (want.length >= 8 && have.length >= 8) {
+      return have.includes(want) || want.includes(have);
+    }
+    return false;
+  });
+}
+
 // Trova la tracklist di un album: prima per releaseId, poi nella collezione, poi sul database Discogs
 async function resolveAlbumTracklist({ artist, album, releaseId }) {
   const cfg = await loadDiscogsConfig();
@@ -446,18 +584,14 @@ async function resolveAlbumTracklist({ artist, album, releaseId }) {
   if (!id && album) {
     try {
       const collection = await loadFullCollection(cfg);
-      const artistNorm = (artist || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      const albumNorm = album.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const albumNorm = normTitle(album);
       const match = collection.find(r => {
-        const titleNorm = r.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const titleNorm = normTitle(r.title);
         const titleOk = titleNorm === albumNorm ||
           (albumNorm.length >= 4 && (titleNorm.includes(albumNorm) || albumNorm.includes(titleNorm)));
         if (!titleOk) return false;
-        if (!artistNorm) return true;
-        return r.artists.some(a => {
-          const aN = a.toLowerCase().replace(/[^a-z0-9]/g, '');
-          return aN === artistNorm || aN.includes(artistNorm) || artistNorm.includes(aN);
-        });
+        if (!artist) return true;
+        return r.artists.some(a => sameArtist(a, artist));
       });
       if (match) {
         id = String(match.id);
@@ -1102,36 +1236,61 @@ app.get('/discogs/search', async (req, res) => {
 
     // ─── STEP 1: Cerca nella collezione cachata (veloce, nessuna chiamata API) ───
     const collection = await loadFullCollection(cfg);
-    const artistLower = artist.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-    // Cerca release nella collezione il cui artista corrisponde
-    // L'includes è permesso solo se la stringa più corta è almeno il 60% di quella più lunga
-    // per evitare falsi positivi tipo "Heart" dentro "Tom Petty & The Heartbreakers"
-    const matches = collection.filter(r => {
-      return r.artists.some(a => {
-        const aLower = a.toLowerCase().replace(/[^a-z0-9]/g, '');
-        if (aLower === artistLower) return true;
-        const shorter = aLower.length < artistLower.length ? aLower : artistLower;
-        const longer = aLower.length < artistLower.length ? artistLower : aLower;
-        if (shorter.length < 4) return false; // nomi troppo corti: solo match esatto
-        if (shorter.length / longer.length < 0.5) return false; // troppo diversi in lunghezza
-        return longer.includes(shorter);
-      });
-    });
+    // Candidati: release della collezione il cui artista corrisponde ESATTAMENTE
+    // (niente includes: "Heart" non deve pescare "Tom Petty & The Heartbreakers")
+    const matches = collection.filter(r => r.artists.some(a => sameArtist(a, artist)));
 
     if (matches.length > 0) {
       console.log(`💿 Discogs: ${matches.length} release di "${artist}" nella tua collezione`);
 
-      // Se c'è un solo match, è quello
-      // Se ce ne sono più di uno, prova a trovare quello il cui titolo corrisponde all'album Shazam
-      let best = matches[0];
-      if (matches.length > 1 && album) {
-        const albumLower = album.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const albumMatch = matches.find(r => {
-          const tLower = r.title.toLowerCase().replace(/[^a-z0-9]/g, '');
-          return tLower === albumLower || tLower.includes(albumLower) || albumLower.includes(tLower);
-        });
-        if (albumMatch) best = albumMatch;
+      const albumNorm = album ? normTitle(album) : '';
+      const shazamYear = parseInt(req.query.year, 10) || 0;
+
+      // Ordina i candidati: prima quelli col titolo album compatibile con Shazam,
+      // così nella maggior parte dei casi la verifica si ferma alla prima release.
+      const scored = matches.map(r => {
+        const tNorm = normTitle(r.title);
+        let priority = 3;
+        if (albumNorm && tNorm === albumNorm) priority = 0;
+        else if (albumNorm && (tNorm.includes(albumNorm) || albumNorm.includes(tNorm))) priority = 1;
+        else if (!albumNorm) priority = 2;
+        const yearGap = shazamYear && r.year ? Math.abs(r.year - shazamYear) : 999;
+        return { r, priority, yearGap };
+      }).sort((a, b) => a.priority - b.priority || a.yearGap - b.yearGap);
+
+      // ─── Verifica che il brano riconosciuto sia DAVVERO nella tracklist ───
+      // Senza questo controllo l'app si aggancia al primo disco dell'artista
+      // (es. Vs. dei Pearl Jam → MTV Unplugged) e ci resta incollata.
+      const MAX_CANDIDATES = 8;   // limite per non saturare le API Discogs
+      let best = null;
+      let bestTracklist = [];
+      const checked = [];
+
+      if (title) {
+        for (const cand of scored.slice(0, MAX_CANDIDATES)) {
+          const tl = await fetchReleaseTracklist(cand.r.id, cfg);
+          checked.push({ cand, tl });
+          if (tracklistHasTrack(tl, title)) {
+            best = cand.r;
+            bestTracklist = tl;
+            console.log(`💿 Match confermato: "${best.title}" contiene "${title}"`);
+            break;
+          }
+        }
+        // Pareggio già risolto dall'ordinamento (priorità titolo, poi vicinanza anno)
+        if (!best) {
+          console.log(`💿 Nessuna release in collezione contiene "${title}" — niente album, solo dati Shazam`);
+          return res.json({
+            found: false,
+            reason: 'track-not-in-collection',
+            checked: checked.length
+          });
+        }
+      } else {
+        // Senza titolo non possiamo verificare nulla: usa il candidato meglio piazzato
+        best = scored[0].r;
+        bestTracklist = await fetchReleaseTracklist(best.id, cfg);
       }
 
       // Mappa le note con nomi campi
@@ -1143,25 +1302,9 @@ app.get('/discogs/search', async (req, res) => {
           value: String(n.value).trim()
         }));
 
-      // Recupera tracklist dalla release Discogs (per pre-fetch testi)
-      let tracklist = [];
-      try {
-        const authHeader = `Discogs key=${cfg.consumerKey}, secret=${cfg.consumerSecret}`;
-        const releaseRes = await fetch(`https://api.discogs.com/releases/${best.id}`, {
-          headers: { 'Authorization': authHeader, 'User-Agent': 'LyricSync/1.0' }
-        });
-        if (releaseRes.ok) {
-          const releaseData = await releaseRes.json();
-          tracklist = (releaseData.tracklist || [])
-            .filter(t => t.type_ === 'track') // escludi headings e subheadings
-            .map(t => ({
-              position: t.position || '',
-              title: t.title || '',
-              duration: t.duration || ''
-            }));
-          console.log(`💿 Discogs tracklist: ${tracklist.length} tracce`);
-        }
-      } catch (e) { console.warn('⚠️ Discogs tracklist error:', e.message); }
+      // Tracklist già scaricata (e messa in cache) durante la verifica del match
+      const tracklist = bestTracklist;
+      console.log(`💿 Discogs tracklist: ${tracklist.length} tracce`);
 
       const result = {
         found: true,
@@ -1198,8 +1341,14 @@ app.get('/discogs/search', async (req, res) => {
 
     if (searchRes.ok) {
       const data = await searchRes.json();
-      if (data.results && data.results.length > 0) {
-        const first = data.results[0];
+      // I risultati Discogs hanno title nel formato "Artista - Album": accetta
+      // solo quelli il cui artista corrisponde davvero a quello riconosciuto.
+      const plausible = (data.results || []).filter(r => {
+        const parts = String(r.title || '').split(' - ');
+        return parts.length < 2 ? false : sameArtist(parts[0], artist);
+      });
+      if (plausible.length > 0) {
+        const first = plausible[0];
         console.log(`💿 Discogs: "${first.title}" trovato ma NON in collezione`);
         return res.json({
           found: true,
@@ -1360,10 +1509,20 @@ app.get('/artist/info', authMiddleware, async (req, res) => {
             occupations.some(id => ['Q177220', 'Q639669', 'Q36834', 'Q488205', 'Q753110', 'Q855091'].includes(id)) || // singer, musician, composer, singer-songwriter
             genres.length > 0;
 
-          if (isMusical) {
+          // Il nome deve corrispondere: senza questo controllo "The Rah Band"
+          // finiva per pescare la prima entità musicale disponibile (es. Queen).
+          const nameOk = sameArtist(entity.label, artist) ||
+            sameArtist(itTitle.replace(/\s*\([^)]*\)\s*$/, ''), artist) ||
+            (entity.aliases || []).some(al => sameArtist(al, artist)) ||
+            sameArtist(entity.match?.text, artist);
+
+          if (isMusical && nameOk) {
             pageTitle = itTitle;
             console.log(`📖 Wikidata: "${artist}" → ${entity.id} → "${itTitle}" (musicale)`);
             break;
+          }
+          if (isMusical && !nameOk) {
+            console.log(`📖 Wikidata: scarto "${entity.label}" — non corrisponde a "${artist}"`);
           }
         }
       }
@@ -1375,8 +1534,17 @@ app.get('/artist/info', authMiddleware, async (req, res) => {
       const searchRes = await fetch(searchUrl, { headers: ua });
       const searchData = await searchRes.json();
       if (searchData.query?.search?.length) {
-        pageTitle = searchData.query.search[0].title;
-        console.log(`📖 Wikipedia fallback: "${artist}" → "${pageTitle}"`);
+        // Accetta solo se il titolo della pagina corrisponde all'artista:
+        // altrimenti si finiva a mostrare la biografia di un'altra band.
+        const hit = searchData.query.search.find(s =>
+          sameArtist(s.title.replace(/\s*\([^)]*\)\s*$/, ''), artist)
+        );
+        if (hit) {
+          pageTitle = hit.title;
+          console.log(`📖 Wikipedia fallback: "${artist}" → "${pageTitle}"`);
+        } else {
+          console.log(`📖 Wikipedia: nessuna pagina corrispondente a "${artist}" — nessuna bio`);
+        }
       }
     }
 
@@ -1448,17 +1616,29 @@ app.get('/discogs/discography', authMiddleware, async (req, res) => {
           const isMusical = instanceOf.some(id => ['Q215380', 'Q2088357', 'Q5741069', 'Q56816954'].includes(id)) ||
             occupations.some(id => ['Q177220', 'Q639669', 'Q36834', 'Q488205', 'Q753110', 'Q855091'].includes(id)) ||
             genres.length > 0;
-          if (isMusical) { pageTitle = itTitle; break; }
+          const nameOk = sameArtist(entity.label, artist) ||
+            sameArtist(itTitle.replace(/\s*\([^)]*\)\s*$/, ''), artist) ||
+            (entity.aliases || []).some(al => sameArtist(al, artist)) ||
+            sameArtist(entity.match?.text, artist);
+          if (isMusical && nameOk) { pageTitle = itTitle; break; }
         }
       }
     } catch {}
 
     if (!pageTitle) {
-      // Fallback: cerca direttamente
+      // Fallback: cerca direttamente, ma solo con corrispondenza esatta del nome
       const searchUrl = `https://it.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(artist)}&format=json&srlimit=3&utf8=1`;
       const searchRes = await fetch(searchUrl, { headers: ua });
       const searchData = await searchRes.json();
-      if (searchData.query?.search?.length) pageTitle = searchData.query.search[0].title;
+      const hit = (searchData.query?.search || []).find(s =>
+        sameArtist(s.title.replace(/\s*\([^)]*\)\s*$/, ''), artist)
+      );
+      if (hit) pageTitle = hit.title;
+    }
+
+    if (!pageTitle) {
+      console.log(`📖 Discografia: nessuna pagina corrispondente a "${artist}"`);
+      return res.json({ found: false, artist });
     }
 
     // Step 2: cerca la pagina "Discografia di <artista>" su Wikipedia IT
